@@ -1,0 +1,1 @@
+from .dominios import carregar_dominio
