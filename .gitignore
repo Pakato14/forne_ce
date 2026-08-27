@@ -1,0 +1,6 @@
+etl/.env
+.venv/
+__pycache__/
+data/raw/
+data/extracted/
+logs/
