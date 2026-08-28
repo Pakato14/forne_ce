@@ -143,3 +143,11 @@ CREATE TABLE IF NOT EXISTS staging.simples (
     data_opcao_mei TEXT,
     data_exclusao_mei TEXT
 );
+
+-- =========================================================
+-- STAGING CNPJ_CE
+-- =========================================================
+
+CREATE TABLE IF NOT EXISTS staging.cnpj_ce (
+    cnpj_basico VARCHAR(8)
+);

@@ -301,6 +301,17 @@ CREATE TABLE IF NOT EXISTS public.socios (
         REFERENCES public.paises(codigo)
 );
 
+-- =========================================================
+-- CNPJ_CE
+-- =========================================================
+
+CREATE TABLE IF NOT EXISTS public.cnpj_ce (
+    cnpj_basico VARCHAR(8) PRIMARY KEY
+);
+
+CREATE INDEX IF NOT EXISTS idx_cnpj_ce
+ON public.cnpj_ce(cnpj_basico);
+
 
 -- =========================================================
 -- SIMPLES
@@ -326,6 +337,38 @@ CREATE TABLE IF NOT EXISTS public.simples (
     carga_id BIGINT REFERENCES public.cargas(id),
 
     PRIMARY KEY (cnpj_basico, competencia)
+);
+
+-- =========================================================
+-- CARGA DO ARQUIVO
+-- =========================================================
+
+CREATE TABLE IF NOT EXISTS public.carga_arquivos (
+    id BIGSERIAL PRIMARY KEY,
+
+    carga_id BIGINT NOT NULL
+        REFERENCES public.cargas(id)
+        ON DELETE CASCADE,
+
+    tipo VARCHAR(30) NOT NULL,
+
+    arquivo TEXT NOT NULL,
+
+    status VARCHAR(30) NOT NULL DEFAULT 'PENDENTE',
+
+    registros_lidos BIGINT DEFAULT 0,
+
+    registros_processados BIGINT DEFAULT 0,
+
+    registros_erro BIGINT DEFAULT 0,
+
+    inicio TIMESTAMP,
+
+    fim TIMESTAMP,
+
+    mensagem_erro TEXT,
+
+    UNIQUE(carga_id, arquivo)
 );
 
 

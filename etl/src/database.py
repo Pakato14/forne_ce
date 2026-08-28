@@ -2,7 +2,6 @@ import psycopg
 
 from config import DATABASE_CONFIG
 
-
 def get_connection():
     return psycopg.connect(
         host=DATABASE_CONFIG["host"],
