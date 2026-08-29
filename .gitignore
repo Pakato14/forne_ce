@@ -1,9 +1,5 @@
-etl/
-.env
-.venv/
-venv/
-__pycache__/
-data/raw/
-data/extracted/
-logs/
-*.pyc
+etl/.env
+etl/.venv/*
+etl/data/*
+etl/src/__pycache__/*
+etl/src/loaders/__pycache__/*
