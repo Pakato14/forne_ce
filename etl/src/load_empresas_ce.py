@@ -88,16 +88,19 @@ def inserir_lote(conn, lote):
     """
     Insere um lote de empresas.
 
+    Retorna:
+        inseridos  -> quantidade de novos registros
+        duplicados -> registros que já existiam
+        erro       -> quantidade de registros que falharam
+
     Utiliza COPY para uma tabela temporária e depois
     INSERT ... ON CONFLICT.
-
-    write_row() é utilizado com COPY em formato TEXT,
-    evitando problemas com aspas e separadores do CSV
-    original da Receita.
     """
 
     if not lote:
-        return 0
+        return 0, 0, 0
+
+    quantidade_lote = len(lote)
 
     try:
 
@@ -174,23 +177,20 @@ def inserir_lote(conn, lote):
                 CARGA_ID
             ))
 
-            inseridos = cur.fetchall()
+            inseridos = cur.rowcount
 
         # --------------------------------------------------------
-        # Confirma somente se todo o lote deu certo
+        # Commit
         # --------------------------------------------------------
 
         conn.commit()
 
-        return len(inseridos)
+        # Tudo que não foi inserido é duplicado
+        duplicados = quantidade_lote - inseridos
+
+        return inseridos, duplicados, 0
 
     except Exception as erro:
-
-        # --------------------------------------------------------
-        # IMPORTANTE:
-        # Se COPY ou INSERT falhar, a transação fica abortada.
-        # Precisamos fazer rollback antes de continuar.
-        # --------------------------------------------------------
 
         conn.rollback()
 
@@ -198,11 +198,11 @@ def inserir_lote(conn, lote):
         print("=" * 70)
         print("ERRO AO INSERIR LOTE")
         print("=" * 70)
-        print(f"Tamanho do lote: {len(lote):,}")
+        print(f"Tamanho do lote: {quantidade_lote:,}")
         print(f"Erro: {erro}")
         print("=" * 70)
 
-        return 0
+        return 0, 0, quantidade_lote
 
 
 def atualizar_carga(
@@ -210,6 +210,7 @@ def atualizar_carga(
     registros_lidos,
     registros_processados,
     registros_inseridos,
+    registros_duplicados,
     registros_erro=0,
     status=None,
     mensagem_erro=None
@@ -232,6 +233,7 @@ def atualizar_carga(
                         registros_lidos = %s,
                         registros_processados = %s,
                         registros_inseridos = %s,
+                        registros_duplicados = %s,
                         registros_erro = %s,
                         mensagem_erro = %s
                     WHERE id = %s
@@ -240,6 +242,7 @@ def atualizar_carga(
                     registros_lidos,
                     registros_processados,
                     registros_inseridos,
+                    registros_duplicados,
                     registros_erro,
                     mensagem_erro,
                     CARGA_ID
@@ -282,6 +285,7 @@ def processar_arquivo(arquivo, conn, cnpjs_ce, qualificacoes_validas, naturezas_
     registros_lidos = 0
     registros_processados = 0
     registros_inseridos = 0
+    registros_duplicados = 0
     registros_erro = 0
 
     lote = []
@@ -407,16 +411,14 @@ def processar_arquivo(arquivo, conn, cnpjs_ce, qualificacoes_validas, naturezas_
 
                     if len(lote) >= TAMANHO_LOTE:
 
-                        novos = inserir_lote(
+                        inseridos, duplicados, erros = inserir_lote(
                             conn,
                             lote
                         )
 
-                        registros_inseridos += novos
-
-                        # Se houve erro no lote, contabiliza
-                        if novos == 0:
-                            registros_erro += len(lote)
+                        registros_inseridos += inseridos
+                        registros_duplicados += duplicados
+                        registros_erro += erros
 
                         lote.clear()
 
@@ -430,12 +432,10 @@ def processar_arquivo(arquivo, conn, cnpjs_ce, qualificacoes_validas, naturezas_
 
                         print(
                             f"Linhas: {registros_lidos:,} | "
-                            f"Empresas CE: "
-                            f"{registros_processados:,} | "
-                            f"Novas: "
-                            f"{registros_inseridos:,} | "
-                            f"Erros: "
-                            f"{registros_erro:,}"
+                            f"Empresas CE: {registros_processados:,} | "
+                            f"Inseridas: {registros_inseridos:,} | "
+                            f"Duplicadas: {registros_duplicados:,} | "
+                            f"Erros: {registros_erro:,}"
                         )
 
                 except Exception as erro:
@@ -453,15 +453,14 @@ def processar_arquivo(arquivo, conn, cnpjs_ce, qualificacoes_validas, naturezas_
 
             if lote:
 
-                novos = inserir_lote(
+                inseridos, duplicados, erros = inserir_lote(
                     conn,
                     lote
                 )
 
-                registros_inseridos += novos
-
-                if novos == 0:
-                    registros_erro += len(lote)
+                registros_inseridos += inseridos
+                registros_duplicados += duplicados
+                registros_erro += erros                
 
                 lote.clear()
 
@@ -471,6 +470,7 @@ def processar_arquivo(arquivo, conn, cnpjs_ce, qualificacoes_validas, naturezas_
     print(f"Linhas lidas:       {registros_lidos:,}")
     print(f"Empresas do CE:     {registros_processados:,}")
     print(f"Empresas novas:     {registros_inseridos:,}")
+    print(f"Duplicadas:         {registros_duplicados:,}")
     print(f"Erros:              {registros_erro:,}")
     print(f"Tempo:              {tempo / 60:.2f} minutos")
 
@@ -478,6 +478,7 @@ def processar_arquivo(arquivo, conn, cnpjs_ce, qualificacoes_validas, naturezas_
         registros_lidos,
         registros_processados,
         registros_inseridos,
+        registros_duplicados,
         registros_erro
     )
 
@@ -562,6 +563,7 @@ def main():
         total_lidos = 0
         total_processados = 0
         total_inseridos = 0
+        total_duplicados = 0
         total_erros = 0
 
         # --------------------------------------------------------
@@ -582,12 +584,14 @@ def main():
                 lidos,
                 processados,
                 inseridos,
+                duplicados,
                 erros
             ) = resultado
 
             total_lidos += lidos
             total_processados += processados
             total_inseridos += inseridos
+            total_duplicados += duplicados
             total_erros += erros
 
         # --------------------------------------------------------
