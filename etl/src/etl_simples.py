@@ -8,29 +8,13 @@ from database import get_connection
 
 
 COMPETENCIA = "2026-08"
-CARGA_ID = 3
+CARGA_ID = 4
 TAMANHO_LOTE = 10_000
-
-
-def carregar_codigos_validos(conn, tabela):
-
-    with conn.cursor() as cur:
-
-        cur.execute(f"""
-            SELECT codigo
-            FROM {tabela}
-        """)
-
-        return {
-            str(row[0]).strip()
-            for row in cur.fetchall()
-            if row[0] is not None
-        }
 
 
 def carregar_cnpjs_ce(conn):
 
-    print("Carregando lista de CNPJs do Ceará...")
+    print("Carregando CNPJs do Ceará...")
 
     with conn.cursor() as cur:
 
@@ -42,43 +26,12 @@ def carregar_cnpjs_ce(conn):
         cnpjs = {
             str(row[0]).strip()
             for row in cur.fetchall()
+            if row[0] is not None
         }
 
-    print(
-        f"CNPJs do Ceará carregados em memória: "
-        f"{len(cnpjs):,}"
-    )
+    print(f"CNPJs CE carregados: {len(cnpjs):,}")
 
     return cnpjs
-
-
-def carregar_empresas(conn):
-
-    print("Carregando empresas da competência...")
-
-    with conn.cursor() as cur:
-
-        cur.execute("""
-            SELECT
-                id,
-                cnpj_basico
-            FROM empresas
-            WHERE competencia = %s
-        """, (
-            COMPETENCIA,
-        ))
-
-        empresas = {
-            str(row[1]).strip(): row[0]
-            for row in cur.fetchall()
-        }
-
-    print(
-        f"Empresas carregadas em memória: "
-        f"{len(empresas):,}"
-    )
-
-    return empresas
 
 
 def converter_data(valor):
@@ -92,14 +45,12 @@ def converter_data(valor):
         return None
 
     try:
-
         return datetime.strptime(
             valor,
             "%Y%m%d"
         ).date()
 
     except ValueError:
-
         return None
 
 
@@ -125,85 +76,63 @@ def inserir_lote(conn, lote):
         with conn.cursor() as cur:
 
             cur.execute("""
-                CREATE TEMP TABLE IF NOT EXISTS tmp_socios (
-                    empresa_id BIGINT,
-                    tipo_socio_codigo VARCHAR(2),
-                    nome_socio TEXT,
-                    documento_socio VARCHAR(20),
-                    qualificacao_codigo VARCHAR(2),
-                    data_entrada DATE,
-                    pais_codigo VARCHAR(3),
-                    representante_legal_documento VARCHAR(20),
-                    representante_legal_nome TEXT,
-                    qualificacao_representante_codigo VARCHAR(2),
-                    faixa_etaria VARCHAR(2)
+                CREATE TEMP TABLE IF NOT EXISTS tmp_simples (
+                    cnpj_basico VARCHAR(8),
+                    opcao_simples VARCHAR(1),
+                    data_opcao_simples DATE,
+                    data_exclusao_simples DATE,
+                    opcao_mei VARCHAR(1),
+                    data_opcao_mei DATE,
+                    data_exclusao_mei DATE
                 )
                 ON COMMIT DELETE ROWS
             """)
 
             with cur.copy("""
-                COPY tmp_socios (
-                    empresa_id,
-                    tipo_socio_codigo,
-                    nome_socio,
-                    documento_socio,
-                    qualificacao_codigo,
-                    data_entrada,
-                    pais_codigo,
-                    representante_legal_documento,
-                    representante_legal_nome,
-                    qualificacao_representante_codigo,
-                    faixa_etaria
+                COPY tmp_simples (
+                    cnpj_basico,
+                    opcao_simples,
+                    data_opcao_simples,
+                    data_exclusao_simples,
+                    opcao_mei,
+                    data_opcao_mei,
+                    data_exclusao_mei
                 )
                 FROM STDIN
             """) as copy:
 
                 for registro in lote:
-
                     copy.write_row(registro)
 
             cur.execute("""
-                INSERT INTO socios (
-                    empresa_id,
-                    tipo_socio_codigo,
-                    nome_socio,
-                    documento_socio,
-                    qualificacao_codigo,
-                    data_entrada,
-                    pais_codigo,
-                    representante_legal_documento,
-                    representante_legal_nome,
-                    qualificacao_representante_codigo,
-                    faixa_etaria,
+                INSERT INTO simples (
+                    cnpj_basico,
+                    opcao_simples,
+                    data_opcao_simples,
+                    data_exclusao_simples,
+                    opcao_mei,
+                    data_opcao_mei,
+                    data_exclusao_mei,
                     competencia,
                     carga_id
                 )
                 SELECT
-                    empresa_id,
-                    tipo_socio_codigo,
-                    nome_socio,
-                    documento_socio,
-                    qualificacao_codigo,
-                    data_entrada,
-                    pais_codigo,
-                    representante_legal_documento,
-                    representante_legal_nome,
-                    qualificacao_representante_codigo,
-                    faixa_etaria,
+                    cnpj_basico,
+                    opcao_simples,
+                    data_opcao_simples,
+                    data_exclusao_simples,
+                    opcao_mei,
+                    data_opcao_mei,
+                    data_exclusao_mei,
                     %s,
                     %s
-                FROM tmp_socios
-
+                FROM tmp_simples
                 ON CONFLICT (
-                    empresa_id,
-                    tipo_socio_codigo,
-                    documento_socio,
-                    qualificacao_codigo,
+                    cnpj_basico,
                     competencia
                 )
                 DO NOTHING
-
-                RETURNING id
+                RETURNING cnpj_basico
             """, (
                 COMPETENCIA,
                 CARGA_ID
@@ -223,7 +152,7 @@ def inserir_lote(conn, lote):
 
         print()
         print("=" * 70)
-        print("ERRO AO INSERIR LOTE DE SÓCIOS")
+        print("ERRO AO INSERIR LOTE DO SIMPLES")
         print("=" * 70)
         print(f"Tamanho do lote: {quantidade_lote:,}")
         print(f"Erro: {erro}")
@@ -296,10 +225,7 @@ def atualizar_carga(
 def processar_arquivo(
     arquivo,
     conn,
-    cnpjs_ce,
-    empresas,
-    qualificacoes_validas,
-    paises_validos
+    cnpjs_ce
 ):
 
     print()
@@ -319,19 +245,18 @@ def processar_arquivo(
 
     with zipfile.ZipFile(arquivo, "r") as z:
 
-        csv_files = [
+        arquivos_csv = [
             nome
             for nome in z.namelist()
-            if nome.upper().endswith(".SOCIOCSV")
+            if ".SIMPLES.CSV." in nome.upper()
         ]
 
-        if not csv_files:
-
+        if not arquivos_csv:
             raise RuntimeError(
-                f"Nenhum arquivo SOCIOCSV encontrado em {arquivo}"
+                f"Nenhum arquivo SIMPLES encontrado em {arquivo}"
             )
 
-        nome_csv = csv_files[0]
+        nome_csv = arquivos_csv[0]
 
         print(f"Arquivo interno: {nome_csv}")
 
@@ -354,92 +279,51 @@ def processar_arquivo(
 
                 try:
 
-                    if len(linha) != 11:
-
+                    if len(linha) != 7:
                         registros_erro += 1
                         continue
 
                     cnpj_basico = linha[0].strip()
 
                     if not cnpj_basico:
-
                         registros_erro += 1
                         continue
 
                     if cnpj_basico not in cnpjs_ce:
-
                         continue
 
-                    empresa_id = empresas.get(cnpj_basico)
-
-                    if empresa_id is None:
-
-                        registros_erro += 1
-                        continue
-
-                    tipo_socio = normalizar_texto(
+                    opcao_simples = normalizar_texto(
                         linha[1]
                     )
 
-                    nome_socio = normalizar_texto(
+                    data_opcao_simples = converter_data(
                         linha[2]
                     )
 
-                    documento_socio = normalizar_texto(
+                    data_exclusao_simples = converter_data(
                         linha[3]
                     )
 
-                    qualificacao = normalizar_texto(
+                    opcao_mei = normalizar_texto(
                         linha[4]
                     )
 
-                    if (
-                        qualificacao
-                        and qualificacao not in qualificacoes_validas
-                    ):
-
-                        qualificacao = None
-
-                    data_entrada = converter_data(
+                    data_opcao_mei = converter_data(
                         linha[5]
                     )
 
-                    pais = normalizar_texto(
+                    data_exclusao_mei = converter_data(
                         linha[6]
                     )
 
-                    if pais and pais not in paises_validos:
-
-                        pais = None
-
-                    representante_documento = normalizar_texto(
-                        linha[7]
-                    )
-
-                    representante_nome = normalizar_texto(
-                        linha[8]
-                    )
-
-                    qualificacao_representante = normalizar_texto(
-                        linha[9]
-                    )
-
-                    faixa_etaria = normalizar_texto(
-                        linha[10]
-                    )
-
                     lote.append((
-                        empresa_id,
-                        tipo_socio,
-                        nome_socio,
-                        documento_socio,
-                        qualificacao,
-                        data_entrada,
-                        pais,
-                        representante_documento,
-                        representante_nome,
-                        qualificacao_representante,
-                        faixa_etaria
+                        cnpj_basico,
+                        opcao_simples,
+                        data_opcao_simples,
+                        data_exclusao_simples,
+                        opcao_mei,
+                        data_opcao_mei,
+                        data_exclusao_mei
                     ))
 
                     registros_processados += 1
@@ -472,7 +356,7 @@ def processar_arquivo(
 
                         print(
                             f"Linhas: {registros_lidos:,} | "
-                            f"Sócios CE: {registros_processados:,} | "
+                            f"Simples CE: {registros_processados:,} | "
                             f"Inseridos: {registros_inseridos:,} | "
                             f"Duplicados: {registros_duplicados:,} | "
                             f"Erros: {registros_erro:,}"
@@ -508,7 +392,7 @@ def processar_arquivo(
 
     print()
     print(f"Linhas lidas:   {registros_lidos:,}")
-    print(f"Sócios CE:      {registros_processados:,}")
+    print(f"Simples CE:     {registros_processados:,}")
     print(f"Inseridos:      {registros_inseridos:,}")
     print(f"Duplicados:     {registros_duplicados:,}")
     print(f"Erros:          {registros_erro:,}")
@@ -527,7 +411,7 @@ def main():
 
     print()
     print("=" * 70)
-    print("CARGA DE SÓCIOS DO CEARÁ")
+    print("CARGA DO SIMPLES NACIONAL / MEI - CEARÁ")
     print("=" * 70)
 
     print(f"Competência: {COMPETENCIA}")
@@ -538,77 +422,26 @@ def main():
 
     try:
 
-        qualificacoes_validas = carregar_codigos_validos(
-            conn,
-            "qualificacoes"
-        )
-
-        paises_validos = carregar_codigos_validos(
-            conn,
-            "paises"
-        )
-
-        print(
-            f"Qualificações válidas: "
-            f"{len(qualificacoes_validas):,}"
-        )
-
-        print(
-            f"Países válidos: "
-            f"{len(paises_validos):,}"
-        )
-
         cnpjs_ce = carregar_cnpjs_ce(conn)
 
-        empresas = carregar_empresas(conn)
+        arquivo = RAW_DIR / "Simples.zip"
 
-        arquivos = sorted(
-            RAW_DIR.glob("Socios*.zip")
-        )
-
-        if not arquivos:
-
+        if not arquivo.exists():
             raise FileNotFoundError(
-                f"Nenhum Socios*.zip encontrado em {RAW_DIR}"
+                f"Arquivo não encontrado: {arquivo}"
             )
 
-        print()
-        print("Arquivos encontrados:")
-
-        for arquivo in arquivos:
-            print(f" - {arquivo.name}")
-
-        print()
-        print(f"Total: {len(arquivos)} arquivos")
-
-        total_lidos = 0
-        total_processados = 0
-        total_inseridos = 0
-        total_duplicados = 0
-        total_erros = 0
-
-        for arquivo in arquivos:
-
-            (
-                lidos,
-                processados,
-                inseridos,
-                duplicados,
-                erros
-            ) = processar_arquivo(
-                arquivo,
-                conn,
-                cnpjs_ce,
-                empresas,
-                qualificacoes_validas,
-                paises_validos
-            )
-
-            total_lidos += lidos
-            total_processados += processados
-            total_inseridos += inseridos
-            total_duplicados += duplicados
-            total_erros += erros
+        (
+            total_lidos,
+            total_processados,
+            total_inseridos,
+            total_duplicados,
+            total_erros
+        ) = processar_arquivo(
+            arquivo,
+            conn,
+            cnpjs_ce
+        )
 
         atualizar_carga(
             conn,
@@ -622,11 +455,11 @@ def main():
 
         print()
         print("=" * 70)
-        print("CARGA DE SÓCIOS CONCLUÍDA")
+        print("CARGA DO SIMPLES CONCLUÍDA")
         print("=" * 70)
 
         print(f"Linhas lidas:   {total_lidos:,}")
-        print(f"Sócios CE:      {total_processados:,}")
+        print(f"Simples CE:     {total_processados:,}")
         print(f"Inseridos:      {total_inseridos:,}")
         print(f"Duplicados:     {total_duplicados:,}")
         print(f"Erros:          {total_erros:,}")
@@ -635,12 +468,10 @@ def main():
 
     except KeyboardInterrupt:
 
-        print()
-        print("=" * 70)
-        print("PROCESSAMENTO INTERROMPIDO PELO USUÁRIO")
-        print("=" * 70)
-
         conn.rollback()
+
+        print()
+        print("Processamento interrompido.")
 
     except Exception as erro:
 
@@ -648,7 +479,7 @@ def main():
 
         print()
         print("=" * 70)
-        print("ERRO NA CARGA")
+        print("ERRO NA CARGA DO SIMPLES")
         print("=" * 70)
         print(erro)
 
