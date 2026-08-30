@@ -1,123 +1,208 @@
+-- =====================================================================
+-- OBSERVATÓRIO EMPRESARIAL - RECEITA FEDERAL
+-- 001_schema.sql
+--
+-- Estrutura principal do banco de dados.
+--
+-- Ordem de inicialização:
+--   001_schema.sql
+--   002_staging.sql
+--   003_indexes.sql
+-- =====================================================================
+
+
+-- =====================================================================
+-- EXTENSÕES
+-- =====================================================================
+
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+
+-- =====================================================================
+-- SCHEMAS
+-- =====================================================================
 
 CREATE SCHEMA IF NOT EXISTS staging;
 CREATE SCHEMA IF NOT EXISTS analytics;
 
 
--- =========================================================
+-- =====================================================================
 -- CONTROLE DAS CARGAS
--- =========================================================
+-- =====================================================================
 
 CREATE TABLE IF NOT EXISTS public.cargas (
+
     id BIGSERIAL PRIMARY KEY,
 
     competencia VARCHAR(7) NOT NULL,
 
-    data_inicio TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    tipo_carga VARCHAR(30) NOT NULL,
+
+    data_inicio TIMESTAMP NOT NULL
+        DEFAULT CURRENT_TIMESTAMP,
 
     data_fim TIMESTAMP,
 
     status VARCHAR(30) NOT NULL,
 
-    registros_lidos BIGINT DEFAULT 0,
+    registros_lidos BIGINT NOT NULL
+        DEFAULT 0,
 
-    registros_processados BIGINT DEFAULT 0,
+    registros_processados BIGINT NOT NULL
+        DEFAULT 0,
 
-    registros_inseridos BIGINT DEFAULT 0,
+    registros_inseridos BIGINT NOT NULL
+        DEFAULT 0,
 
-    registros_atualizados BIGINT DEFAULT 0,
+    registros_atualizados BIGINT NOT NULL
+        DEFAULT 0,
 
-    registros_erro BIGINT DEFAULT 0,
+    registros_duplicados BIGINT NOT NULL
+        DEFAULT 0,
+
+    registros_erro BIGINT NOT NULL
+        DEFAULT 0,
 
     mensagem_erro TEXT,
 
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP NOT NULL
+        DEFAULT CURRENT_TIMESTAMP
+
 );
 
 
--- =========================================================
+-- =====================================================================
 -- CNAES
--- =========================================================
+-- =====================================================================
 
 CREATE TABLE IF NOT EXISTS public.cnaes (
+
     codigo VARCHAR(7) PRIMARY KEY,
 
     descricao TEXT NOT NULL,
 
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP NOT NULL
+        DEFAULT CURRENT_TIMESTAMP
+
 );
 
 
--- =========================================================
--- MOTIVOS
--- =========================================================
+-- =====================================================================
+-- MOTIVOS DA SITUAÇÃO CADASTRAL
+-- =====================================================================
 
 CREATE TABLE IF NOT EXISTS public.motivos_situacao (
+
     codigo VARCHAR(2) PRIMARY KEY,
 
     descricao TEXT NOT NULL,
 
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP NOT NULL
+        DEFAULT CURRENT_TIMESTAMP
+
 );
 
 
--- =========================================================
+-- =====================================================================
 -- MUNICÍPIOS
--- =========================================================
+-- =====================================================================
 
 CREATE TABLE IF NOT EXISTS public.municipios (
+
     codigo VARCHAR(4) PRIMARY KEY,
 
     nome VARCHAR(150) NOT NULL,
 
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP NOT NULL
+        DEFAULT CURRENT_TIMESTAMP
+
 );
 
 
--- =========================================================
+-- =====================================================================
 -- NATUREZAS JURÍDICAS
--- =========================================================
+-- =====================================================================
 
 CREATE TABLE IF NOT EXISTS public.naturezas_juridicas (
+
     codigo VARCHAR(4) PRIMARY KEY,
 
     descricao TEXT NOT NULL,
 
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP NOT NULL
+        DEFAULT CURRENT_TIMESTAMP
+
 );
 
 
--- =========================================================
+-- =====================================================================
 -- PAÍSES
--- =========================================================
+-- =====================================================================
 
 CREATE TABLE IF NOT EXISTS public.paises (
+
     codigo VARCHAR(3) PRIMARY KEY,
 
     nome VARCHAR(150) NOT NULL,
 
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP NOT NULL
+        DEFAULT CURRENT_TIMESTAMP
+
 );
 
 
--- =========================================================
+-- =====================================================================
 -- QUALIFICAÇÕES
--- =========================================================
+-- =====================================================================
 
 CREATE TABLE IF NOT EXISTS public.qualificacoes (
+
     codigo VARCHAR(2) PRIMARY KEY,
 
     descricao TEXT NOT NULL,
 
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP NOT NULL
+        DEFAULT CURRENT_TIMESTAMP
+
 );
 
 
--- =========================================================
+-- =====================================================================
+-- CNPJ CE
+--
+-- Representa os CNPJs básicos identificados a partir de estabelecimentos
+-- localizados no Ceará em determinada competência.
+--
+-- Um mesmo CNPJ pode aparecer em competências diferentes.
+-- =====================================================================
+
+CREATE TABLE IF NOT EXISTS public.cnpj_ce (
+
+    cnpj_basico VARCHAR(8) NOT NULL,
+
+    competencia VARCHAR(7) NOT NULL,
+
+    carga_id BIGINT
+        REFERENCES public.cargas(id),
+
+    created_at TIMESTAMP NOT NULL
+        DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT pk_cnpj_ce
+        PRIMARY KEY (
+            cnpj_basico,
+            competencia
+        )
+
+);
+
+
+-- =====================================================================
 -- EMPRESAS
--- =========================================================
+-- =====================================================================
 
 CREATE TABLE IF NOT EXISTS public.empresas (
+
     id BIGSERIAL PRIMARY KEY,
 
     cnpj_basico VARCHAR(8) NOT NULL,
@@ -136,30 +221,56 @@ CREATE TABLE IF NOT EXISTS public.empresas (
 
     competencia VARCHAR(7) NOT NULL,
 
-    carga_id BIGINT REFERENCES public.cargas(id),
+    carga_id BIGINT
+        REFERENCES public.cargas(id),
 
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP NOT NULL
+        DEFAULT CURRENT_TIMESTAMP,
 
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL
+        DEFAULT CURRENT_TIMESTAMP,
+
+
+    -- ---------------------------------------------------------
+    -- UNIQUE
+    -- ---------------------------------------------------------
 
     CONSTRAINT uk_empresa_competencia
-        UNIQUE (cnpj_basico, competencia),
+        UNIQUE (
+            cnpj_basico,
+            competencia
+        ),
+
+
+    -- ---------------------------------------------------------
+    -- FOREIGN KEYS
+    -- ---------------------------------------------------------
 
     CONSTRAINT fk_empresa_natureza
-        FOREIGN KEY (natureza_juridica_codigo)
-        REFERENCES public.naturezas_juridicas(codigo),
+        FOREIGN KEY (
+            natureza_juridica_codigo
+        )
+        REFERENCES public.naturezas_juridicas (
+            codigo
+        ),
 
     CONSTRAINT fk_empresa_qualificacao
-        FOREIGN KEY (qualificacao_responsavel_codigo)
-        REFERENCES public.qualificacoes(codigo)
+        FOREIGN KEY (
+            qualificacao_responsavel_codigo
+        )
+        REFERENCES public.qualificacoes (
+            codigo
+        )
+
 );
 
 
--- =========================================================
+-- =====================================================================
 -- ESTABELECIMENTOS
--- =========================================================
+-- =====================================================================
 
 CREATE TABLE IF NOT EXISTS public.estabelecimentos (
+
     id BIGSERIAL PRIMARY KEY,
 
     empresa_id BIGINT NOT NULL
@@ -228,38 +339,72 @@ CREATE TABLE IF NOT EXISTS public.estabelecimentos (
 
     competencia VARCHAR(7) NOT NULL,
 
-    carga_id BIGINT REFERENCES public.cargas(id),
+    carga_id BIGINT
+        REFERENCES public.cargas(id),
 
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP NOT NULL
+        DEFAULT CURRENT_TIMESTAMP,
 
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL
+        DEFAULT CURRENT_TIMESTAMP,
+
+
+    -- ---------------------------------------------------------
+    -- UNIQUE
+    -- ---------------------------------------------------------
 
     CONSTRAINT uk_estabelecimento_competencia
-        UNIQUE (cnpj_completo, competencia),
+        UNIQUE (
+            cnpj_completo,
+            competencia
+        ),
+
+
+    -- ---------------------------------------------------------
+    -- FOREIGN KEYS
+    -- ---------------------------------------------------------
 
     CONSTRAINT fk_estabelecimento_cnae
-        FOREIGN KEY (cnae_principal_codigo)
-        REFERENCES public.cnaes(codigo),
+        FOREIGN KEY (
+            cnae_principal_codigo
+        )
+        REFERENCES public.cnaes (
+            codigo
+        ),
 
     CONSTRAINT fk_estabelecimento_municipio
-        FOREIGN KEY (municipio_codigo)
-        REFERENCES public.municipios(codigo),
+        FOREIGN KEY (
+            municipio_codigo
+        )
+        REFERENCES public.municipios (
+            codigo
+        ),
 
     CONSTRAINT fk_estabelecimento_motivo
-        FOREIGN KEY (motivo_situacao_codigo)
-        REFERENCES public.motivos_situacao(codigo),
+        FOREIGN KEY (
+            motivo_situacao_codigo
+        )
+        REFERENCES public.motivos_situacao (
+            codigo
+        ),
 
     CONSTRAINT fk_estabelecimento_pais
-        FOREIGN KEY (pais_codigo)
-        REFERENCES public.paises(codigo)
+        FOREIGN KEY (
+            pais_codigo
+        )
+        REFERENCES public.paises (
+            codigo
+        )
+
 );
 
 
--- =========================================================
+-- =====================================================================
 -- SÓCIOS
--- =========================================================
+-- =====================================================================
 
 CREATE TABLE IF NOT EXISTS public.socios (
+
     id BIGSERIAL PRIMARY KEY,
 
     empresa_id BIGINT NOT NULL
@@ -288,36 +433,61 @@ CREATE TABLE IF NOT EXISTS public.socios (
 
     competencia VARCHAR(7) NOT NULL,
 
-    carga_id BIGINT REFERENCES public.cargas(id),
+    carga_id BIGINT
+        REFERENCES public.cargas(id),
 
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP NOT NULL
+        DEFAULT CURRENT_TIMESTAMP,
+
+
+    -- ---------------------------------------------------------
+    -- UNIQUE
+    --
+    -- NULLS NOT DISTINCT faz com que NULL seja considerado
+    -- igual a NULL para fins da restrição de unicidade.
+    --
+    -- PostgreSQL 15+
+    -- ---------------------------------------------------------
+
+    CONSTRAINT uk_socio_competencia
+        UNIQUE NULLS NOT DISTINCT (
+            empresa_id,
+            tipo_socio_codigo,
+            documento_socio,
+            qualificacao_codigo,
+            competencia
+        ),
+
+
+    -- ---------------------------------------------------------
+    -- FOREIGN KEYS
+    -- ---------------------------------------------------------
 
     CONSTRAINT fk_socio_qualificacao
-        FOREIGN KEY (qualificacao_codigo)
-        REFERENCES public.qualificacoes(codigo),
+        FOREIGN KEY (
+            qualificacao_codigo
+        )
+        REFERENCES public.qualificacoes (
+            codigo
+        ),
 
     CONSTRAINT fk_socio_pais
-        FOREIGN KEY (pais_codigo)
-        REFERENCES public.paises(codigo)
+        FOREIGN KEY (
+            pais_codigo
+        )
+        REFERENCES public.paises (
+            codigo
+        )
+
 );
 
--- =========================================================
--- CNPJ_CE
--- =========================================================
 
-CREATE TABLE IF NOT EXISTS public.cnpj_ce (
-    cnpj_basico VARCHAR(8) PRIMARY KEY
-);
-
-CREATE INDEX IF NOT EXISTS idx_cnpj_ce
-ON public.cnpj_ce(cnpj_basico);
-
-
--- =========================================================
--- SIMPLES
--- =========================================================
+-- =====================================================================
+-- SIMPLES NACIONAL / MEI
+-- =====================================================================
 
 CREATE TABLE IF NOT EXISTS public.simples (
+
     cnpj_basico VARCHAR(8) NOT NULL,
 
     opcao_simples VARCHAR(1),
@@ -334,94 +504,16 @@ CREATE TABLE IF NOT EXISTS public.simples (
 
     competencia VARCHAR(7) NOT NULL,
 
-    carga_id BIGINT REFERENCES public.cargas(id),
+    carga_id BIGINT
+        REFERENCES public.cargas(id),
 
-    PRIMARY KEY (cnpj_basico, competencia)
+    created_at TIMESTAMP NOT NULL
+        DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT pk_simples
+        PRIMARY KEY (
+            cnpj_basico,
+            competencia
+        )
+
 );
-
--- =========================================================
--- CARGA DO ARQUIVO
--- =========================================================
-
-CREATE TABLE IF NOT EXISTS public.carga_arquivos (
-    id BIGSERIAL PRIMARY KEY,
-
-    carga_id BIGINT NOT NULL
-        REFERENCES public.cargas(id)
-        ON DELETE CASCADE,
-
-    tipo VARCHAR(30) NOT NULL,
-
-    arquivo TEXT NOT NULL,
-
-    status VARCHAR(30) NOT NULL DEFAULT 'PENDENTE',
-
-    registros_lidos BIGINT DEFAULT 0,
-
-    registros_processados BIGINT DEFAULT 0,
-
-    registros_erro BIGINT DEFAULT 0,
-
-    inicio TIMESTAMP,
-
-    fim TIMESTAMP,
-
-    mensagem_erro TEXT,
-
-    UNIQUE(carga_id, arquivo)
-);
-
-
--- =========================================================
--- ÍNDICES
--- =========================================================
-
-CREATE INDEX IF NOT EXISTS idx_empresas_razao_social
-ON public.empresas
-USING gin (razao_social gin_trgm_ops);
-
-
-CREATE INDEX IF NOT EXISTS idx_empresas_cnpj
-ON public.empresas(cnpj_basico);
-
-
-CREATE INDEX IF NOT EXISTS idx_estabelecimentos_cnpj_basico
-ON public.estabelecimentos(cnpj_basico);
-
-
-CREATE INDEX IF NOT EXISTS idx_estabelecimentos_cnpj_completo
-ON public.estabelecimentos(cnpj_completo);
-
-
-CREATE INDEX IF NOT EXISTS idx_estabelecimentos_nome
-ON public.estabelecimentos
-USING gin (nome_fantasia gin_trgm_ops);
-
-
-CREATE INDEX IF NOT EXISTS idx_estabelecimentos_cnae
-ON public.estabelecimentos(cnae_principal_codigo);
-
-
-CREATE INDEX IF NOT EXISTS idx_estabelecimentos_municipio
-ON public.estabelecimentos(municipio_codigo);
-
-
-CREATE INDEX IF NOT EXISTS idx_estabelecimentos_uf
-ON public.estabelecimentos(uf);
-
-
-CREATE INDEX IF NOT EXISTS idx_estabelecimentos_situacao
-ON public.estabelecimentos(situacao_cadastral_codigo);
-
-
-CREATE INDEX IF NOT EXISTS idx_socios_empresa
-ON public.socios(empresa_id);
-
-
-CREATE INDEX IF NOT EXISTS idx_socios_nome
-ON public.socios
-USING gin (nome_socio gin_trgm_ops);
-
-
-CREATE INDEX IF NOT EXISTS idx_socios_documento
-ON public.socios(documento_socio);

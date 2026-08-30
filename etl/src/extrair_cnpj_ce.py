@@ -2,19 +2,40 @@ import csv
 import io
 import zipfile
 
-from config import RAW_DIR
+from config import RAW_DIR, COMPETENCIA
 from database import get_connection
+from services.carga_service import (
+    iniciar_carga,
+    atualizar_carga,
+    concluir_carga,
+    falhar_carga,
+    interromper_carga,
+)
 
 
+TIPO_CARGA = "CNPJ_CE"
 UF_CEARA = "CE"
 TAMANHO_LOTE = 100_000
 
 
-def inserir_lote(conn, lote):
-    """
-    Insere um lote de CNPJs na tabela cnpj_ce.
+# ============================================================
+# INSERIR LOTE
+# ============================================================
 
-    Retorna a quantidade de novos CNPJs efetivamente inseridos.
+def inserir_lote(
+    conn,
+    lote,
+    competencia,
+    carga_id,
+):
+    """
+    Insere CNPJs básicos identificados no Ceará.
+
+    A unicidade é definida por:
+
+        cnpj_basico + competencia
+
+    Retorna a quantidade efetivamente inserida.
     """
 
     if not lote:
@@ -22,177 +43,264 @@ def inserir_lote(conn, lote):
 
     with conn.cursor() as cur:
 
-        cur.execute("""
+        # ----------------------------------------------------
+        # Tabela temporária
+        # ----------------------------------------------------
+
+        cur.execute(
+            """
             CREATE TEMP TABLE IF NOT EXISTS tmp_cnpj_ce (
                 cnpj_basico VARCHAR(8)
-            ) ON COMMIT DELETE ROWS
-        """)
+            )
+            ON COMMIT DELETE ROWS
+            """
+        )
+
+        # ----------------------------------------------------
+        # COPY
+        # ----------------------------------------------------
 
         with cur.copy(
             """
-            COPY tmp_cnpj_ce (cnpj_basico)
+            COPY tmp_cnpj_ce (
+                cnpj_basico
+            )
             FROM STDIN
-            WITH (FORMAT CSV)
+            WITH (
+                FORMAT CSV
+            )
             """
         ) as copy:
 
             for cnpj in lote:
                 copy.write_row((cnpj,))
 
-        cur.execute("""
-            INSERT INTO cnpj_ce (cnpj_basico)
-            SELECT DISTINCT cnpj_basico
-            FROM tmp_cnpj_ce
-            ON CONFLICT (cnpj_basico)
-            DO NOTHING
-            RETURNING cnpj_basico
-        """)
+        # ----------------------------------------------------
+        # Inserção definitiva
+        # ----------------------------------------------------
 
-        novos = cur.fetchall()
+        cur.execute(
+            """
+            INSERT INTO public.cnpj_ce (
+                cnpj_basico,
+                competencia,
+                carga_id
+            )
+
+            SELECT DISTINCT
+                TRIM(cnpj_basico),
+                %s,
+                %s
+
+            FROM tmp_cnpj_ce
+
+            WHERE
+                cnpj_basico IS NOT NULL
+
+                AND LENGTH(
+                    TRIM(cnpj_basico)
+                ) = 8
+
+            ON CONFLICT (
+                cnpj_basico,
+                competencia
+            )
+
+            DO NOTHING
+
+            RETURNING cnpj_basico
+            """,
+            (
+                competencia,
+                carga_id,
+            ),
+        )
+
+        inseridos = cur.fetchall()
 
     conn.commit()
 
-    return len(novos)
+    return len(inseridos)
 
 
-def extrair_cnpj_ce(arquivo_zip):
+# ============================================================
+# PROCESSAR UM ZIP
+# ============================================================
 
-    print("=" * 70)
-    print("IDENTIFICANDO EMPRESAS DO CEARÁ")
-    print("=" * 70)
+def processar_arquivo(
+    conn,
+    arquivo_zip,
+    competencia,
+    carga_id,
+    totais,
+):
+    """
+    Processa um arquivo Estabelecimentos*.zip.
 
-    print(f"ZIP: {arquivo_zip}")
+    Apenas estabelecimentos fisicamente localizados no Ceará
+    são utilizados para formar o conjunto de CNPJs básicos.
+    """
 
-    total_linhas = 0
-    total_ce = 0
-    total_cnpj = 0
+    print()
+    print("#" * 70)
+    print(f"PROCESSANDO: {arquivo_zip.name}")
+    print("#" * 70)
 
     lote = set()
 
-    conn = get_connection()
+    with zipfile.ZipFile(arquivo_zip, "r") as z:
 
-    try:
+        arquivos = [
+            nome
+            for nome in z.namelist()
+            if nome.upper().endswith(".ESTABELE")
+        ]
 
-        with zipfile.ZipFile(arquivo_zip, "r") as z:
+        if not arquivos:
+            raise RuntimeError(
+                f"Nenhum arquivo .ESTABELE encontrado em "
+                f"{arquivo_zip.name}"
+            )
 
-            arquivos = [
-                nome
-                for nome in z.namelist()
-                if nome.upper().endswith(".ESTABELE")
-            ]
+        nome_arquivo = arquivos[0]
 
-            if not arquivos:
-                raise RuntimeError(
-                    "Nenhum arquivo .ESTABELE encontrado dentro do ZIP."
-                )
+        print(f"Arquivo interno: {nome_arquivo}")
+        print()
 
-            nome_arquivo = arquivos[0]
+        with z.open(nome_arquivo) as arquivo:
 
-            print(f"Arquivo interno: {nome_arquivo}")
-            print()
+            texto = io.TextIOWrapper(
+                arquivo,
+                encoding="latin1",
+                errors="replace",
+                newline="",
+            )
 
-            with z.open(nome_arquivo) as arquivo:
+            leitor = csv.reader(
+                texto,
+                delimiter=";",
+                quotechar='"',
+            )
 
-                texto = io.TextIOWrapper(
-                    arquivo,
-                    encoding="latin1",
-                    errors="replace"
-                )
+            for linha in leitor:
 
-                leitor = csv.reader(
-                    texto,
-                    delimiter=";"
-                )
+                totais["lidos"] += 1
 
-                for linha in leitor:
+                # --------------------------------------------
+                # Layout inválido
+                # --------------------------------------------
 
-                    total_linhas += 1
+                if len(linha) < 20:
+                    totais["erros"] += 1
+                    continue
 
-                    if len(linha) < 20:
-                        continue
+                cnpj_basico = linha[0].strip()
+                uf = linha[19].strip().upper()
 
-                    cnpj_basico = linha[0].strip()
-                    uf = linha[19].strip()
+                # --------------------------------------------
+                # Somente estabelecimentos localizados no CE
+                # --------------------------------------------
 
-                    if uf != UF_CEARA:
-                        continue
+                if uf != UF_CEARA:
+                    continue
 
-                    total_ce += 1
+                totais["estabelecimentos_ce"] += 1
 
-                    if len(cnpj_basico) != 8:
-                        continue
+                # --------------------------------------------
+                # Validação do CNPJ básico
+                # --------------------------------------------
 
-                    lote.add(cnpj_basico)
+                if len(cnpj_basico) != 8:
+                    totais["erros"] += 1
+                    continue
 
-                    if len(lote) >= TAMANHO_LOTE:
+                lote.add(cnpj_basico)
 
-                        novos = inserir_lote(
-                            conn,
-                            lote
-                        )
+                # --------------------------------------------
+                # Processar lote
+                # --------------------------------------------
 
-                        total_cnpj += novos
+                if len(lote) >= TAMANHO_LOTE:
 
-                        print(
-                            f"Linhas analisadas: {total_linhas:,} | "
-                            f"Estabelecimentos CE: {total_ce:,} | "
-                            f"CNPJs processados: {total_cnpj:,}"
-                        )
-
-                        lote.clear()
-
-                # Último lote
-
-                if lote:
-
-                    novos = inserir_lote(
-                        conn,
-                        lote
+                    inseridos = inserir_lote(
+                        conn=conn,
+                        lote=lote,
+                        competencia=competencia,
+                        carga_id=carga_id,
                     )
 
-                    total_cnpj += novos
+                    totais["processados"] += len(lote)
+                    totais["inseridos"] += inseridos
+                    totais["duplicados"] += (
+                        len(lote) - inseridos
+                    )
 
                     lote.clear()
 
-        # Quantidade realmente existente no banco
+                    atualizar_carga(
+                        conn,
+                        carga_id,
+                        registros_lidos=totais["lidos"],
+                        registros_processados=totais["processados"],
+                        registros_inseridos=totais["inseridos"],
+                        registros_duplicados=totais["duplicados"],
+                        registros_erro=totais["erros"],
+                    )
 
-        with conn.cursor() as cur:
+                    print(
+                        f"Linhas analisadas: "
+                        f"{totais['lidos']:,} | "
+                        f"Estabelecimentos CE: "
+                        f"{totais['estabelecimentos_ce']:,} | "
+                        f"CNPJs inseridos: "
+                        f"{totais['inseridos']:,} | "
+                        f"Duplicados: "
+                        f"{totais['duplicados']:,}"
+                    )
 
-            cur.execute(
-                "SELECT COUNT(*) FROM cnpj_ce"
-            )
+            # ------------------------------------------------
+            # Último lote do ZIP
+            # ------------------------------------------------
 
-            total_banco = cur.fetchone()[0]
+            if lote:
 
-        print()
-        print("=" * 70)
-        print("RESULTADO")
-        print("=" * 70)
+                tamanho_lote = len(lote)
 
-        print(
-            f"Linhas analisadas:       {total_linhas:,}"
-        )
+                inseridos = inserir_lote(
+                    conn=conn,
+                    lote=lote,
+                    competencia=competencia,
+                    carga_id=carga_id,
+                )
 
-        print(
-            f"Estabelecimentos CE:     {total_ce:,}"
-        )
+                totais["processados"] += tamanho_lote
+                totais["inseridos"] += inseridos
+                totais["duplicados"] += (
+                    tamanho_lote - inseridos
+                )
 
-        print(
-            f"CNPJs enviados ao banco: {total_cnpj:,}"
-        )
+                lote.clear()
 
-        print(
-            f"CNPJs únicos no banco:   {total_banco:,}"
-        )
-
-        print("=" * 70)
-
-    finally:
-
-        conn.close()
+                atualizar_carga(
+                    conn,
+                    carga_id,
+                    registros_lidos=totais["lidos"],
+                    registros_processados=totais["processados"],
+                    registros_inseridos=totais["inseridos"],
+                    registros_duplicados=totais["duplicados"],
+                    registros_erro=totais["erros"],
+                )
 
 
-if __name__ == "__main__":
+# ============================================================
+# EXECUTAR ETL CNPJ CE
+# ============================================================
+
+def executar():
+    """
+    Identifica os CNPJs básicos que possuem pelo menos um
+    estabelecimento localizado no Ceará.
+    """
 
     arquivos = sorted(
         RAW_DIR.glob("Estabelecimentos*.zip")
@@ -200,26 +308,196 @@ if __name__ == "__main__":
 
     if not arquivos:
         raise FileNotFoundError(
-            f"Nenhum ZIP de estabelecimentos encontrado em: {RAW_DIR}"
+            "Nenhum ZIP de estabelecimentos encontrado em: "
+            f"{RAW_DIR}"
         )
 
-    print()
-    print("=" * 70)
-    print("ARQUIVOS DE ESTABELECIMENTOS")
-    print("=" * 70)
+    conn = get_connection()
 
-    for arquivo in arquivos:
-        print(f" - {arquivo.name}")
+    carga_id = None
 
-    print()
-    print(f"Total de arquivos: {len(arquivos)}")
-    print()
+    totais = {
+        "lidos": 0,
+        "estabelecimentos_ce": 0,
+        "processados": 0,
+        "inseridos": 0,
+        "duplicados": 0,
+        "erros": 0,
+    }
 
-    for arquivo in arquivos:
+    try:
+
+        # ----------------------------------------------------
+        # Criar carga
+        # ----------------------------------------------------
+
+        carga_id = iniciar_carga(
+            conn,
+            TIPO_CARGA,
+            COMPETENCIA,
+        )
 
         print()
-        print("#" * 70)
-        print(f"PROCESSANDO: {arquivo.name}")
-        print("#" * 70)
+        print("=" * 70)
+        print("IDENTIFICAÇÃO DOS CNPJS DO CEARÁ")
+        print("=" * 70)
+        print(f"Competência: {COMPETENCIA}")
+        print(f"Carga ID:    {carga_id}")
+        print(f"UF:          {UF_CEARA}")
+        print()
 
-        extrair_cnpj_ce(arquivo)
+        print("ARQUIVOS:")
+        print()
+
+        for arquivo in arquivos:
+            print(f" - {arquivo.name}")
+
+        print()
+        print(f"Total de arquivos: {len(arquivos)}")
+
+        # ----------------------------------------------------
+        # Processar ZIPs
+        # ----------------------------------------------------
+
+        for arquivo in arquivos:
+
+            processar_arquivo(
+                conn=conn,
+                arquivo_zip=arquivo,
+                competencia=COMPETENCIA,
+                carga_id=carga_id,
+                totais=totais,
+            )
+
+        # ----------------------------------------------------
+        # Quantidade da competência no banco
+        # ----------------------------------------------------
+
+        with conn.cursor() as cur:
+
+            cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM public.cnpj_ce
+                WHERE competencia = %s
+                """,
+                (COMPETENCIA,),
+            )
+
+            total_banco = cur.fetchone()[0]
+
+        # ----------------------------------------------------
+        # Finalizar carga
+        # ----------------------------------------------------
+
+        concluir_carga(
+            conn,
+            carga_id,
+            registros_lidos=totais["lidos"],
+            registros_processados=totais["processados"],
+            registros_inseridos=totais["inseridos"],
+            registros_duplicados=totais["duplicados"],
+            registros_erro=totais["erros"],
+        )
+
+        # ----------------------------------------------------
+        # Resultado
+        # ----------------------------------------------------
+
+        print()
+        print("=" * 70)
+        print("RESULTADO")
+        print("=" * 70)
+
+        print(
+            f"Competência:              "
+            f"{COMPETENCIA}"
+        )
+
+        print(
+            f"Linhas analisadas:         "
+            f"{totais['lidos']:,}"
+        )
+
+        print(
+            f"Estabelecimentos no CE:    "
+            f"{totais['estabelecimentos_ce']:,}"
+        )
+
+        print(
+            f"CNPJs processados:         "
+            f"{totais['processados']:,}"
+        )
+
+        print(
+            f"CNPJs inseridos:           "
+            f"{totais['inseridos']:,}"
+        )
+
+        print(
+            f"CNPJs já existentes:       "
+            f"{totais['duplicados']:,}"
+        )
+
+        print(
+            f"Registros com erro:        "
+            f"{totais['erros']:,}"
+        )
+
+        print(
+            f"CNPJs na competência:      "
+            f"{total_banco:,}"
+        )
+
+        print("=" * 70)
+
+    except KeyboardInterrupt:
+
+        if carga_id is not None:
+
+            interromper_carga(
+                conn,
+                carga_id,
+                registros_lidos=totais["lidos"],
+                registros_processados=totais["processados"],
+                registros_inseridos=totais["inseridos"],
+                registros_duplicados=totais["duplicados"],
+                registros_erro=totais["erros"],
+            )
+
+        print()
+        print("Carga interrompida pelo usuário.")
+
+        raise
+
+    except Exception as erro:
+
+        if carga_id is not None:
+
+            falhar_carga(
+                conn,
+                carga_id,
+                erro,
+                registros_lidos=totais["lidos"],
+                registros_processados=totais["processados"],
+                registros_inseridos=totais["inseridos"],
+                registros_duplicados=totais["duplicados"],
+                registros_erro=totais["erros"],
+            )
+
+        print()
+        print(f"Erro durante a carga CNPJ CE: {erro}")
+
+        raise
+
+    finally:
+
+        conn.close()
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+if __name__ == "__main__":
+    executar()

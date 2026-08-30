@@ -1,27 +1,47 @@
 import csv
-import zipfile
 import time
+import zipfile
 from datetime import datetime
 
-from config import RAW_DIR
+from config import RAW_DIR, COMPETENCIA
 from database import get_connection
+from services.carga_service import (
+    iniciar_carga,
+    atualizar_carga,
+    concluir_carga,
+    falhar_carga,
+    interromper_carga,
+)
 
 
-COMPETENCIA = "2026-08"
-CARGA_ID = 4
+TIPO_CARGA = "SIMPLES"
 TAMANHO_LOTE = 10_000
 
 
-def carregar_cnpjs_ce(conn):
+# ============================================================
+# CNPJS DO CEARÁ
+# ============================================================
 
-    print("Carregando CNPJs do Ceará...")
+def carregar_cnpjs_ce(conn, competencia):
+    """
+    Carrega somente os CNPJs pertencentes à competência atual.
+    """
+
+    print(
+        f"Carregando CNPJs do Ceará da competência "
+        f"{competencia}..."
+    )
 
     with conn.cursor() as cur:
 
-        cur.execute("""
+        cur.execute(
+            """
             SELECT cnpj_basico
-            FROM cnpj_ce
-        """)
+            FROM public.cnpj_ce
+            WHERE competencia = %s
+            """,
+            (competencia,),
+        )
 
         cnpjs = {
             str(row[0]).strip()
@@ -29,10 +49,17 @@ def carregar_cnpjs_ce(conn):
             if row[0] is not None
         }
 
-    print(f"CNPJs CE carregados: {len(cnpjs):,}")
+    print(
+        f"CNPJs CE carregados: "
+        f"{len(cnpjs):,}"
+    )
 
     return cnpjs
 
+
+# ============================================================
+# CONVERSÕES
+# ============================================================
 
 def converter_data(valor):
 
@@ -45,12 +72,14 @@ def converter_data(valor):
         return None
 
     try:
+
         return datetime.strptime(
             valor,
-            "%Y%m%d"
+            "%Y%m%d",
         ).date()
 
     except ValueError:
+
         return None
 
 
@@ -64,7 +93,24 @@ def normalizar_texto(valor):
     return valor or None
 
 
-def inserir_lote(conn, lote):
+# ============================================================
+# INSERIR LOTE
+# ============================================================
+
+def inserir_lote(
+    conn,
+    lote,
+    carga_id,
+):
+    """
+    Insere um lote de registros do Simples Nacional / MEI.
+
+    Retorna:
+
+        inseridos
+        duplicados
+        erros
+    """
 
     if not lote:
         return 0, 0, 0
@@ -75,76 +121,141 @@ def inserir_lote(conn, lote):
 
         with conn.cursor() as cur:
 
-            cur.execute("""
+            # ------------------------------------------------
+            # TABELA TEMPORÁRIA
+            # ------------------------------------------------
+
+            cur.execute(
+                """
                 CREATE TEMP TABLE IF NOT EXISTS tmp_simples (
+
                     cnpj_basico VARCHAR(8),
+
                     opcao_simples VARCHAR(1),
+
                     data_opcao_simples DATE,
+
                     data_exclusao_simples DATE,
+
                     opcao_mei VARCHAR(1),
+
                     data_opcao_mei DATE,
+
                     data_exclusao_mei DATE
                 )
                 ON COMMIT DELETE ROWS
-            """)
+                """
+            )
 
-            with cur.copy("""
+            # ------------------------------------------------
+            # COPY
+            # ------------------------------------------------
+
+            with cur.copy(
+                """
                 COPY tmp_simples (
+
                     cnpj_basico,
+
                     opcao_simples,
+
                     data_opcao_simples,
+
                     data_exclusao_simples,
+
                     opcao_mei,
+
                     data_opcao_mei,
+
                     data_exclusao_mei
                 )
+
                 FROM STDIN
-            """) as copy:
+                """
+            ) as copy:
 
                 for registro in lote:
+
                     copy.write_row(registro)
 
-            cur.execute("""
-                INSERT INTO simples (
+            # ------------------------------------------------
+            # INSERT DEFINITIVO
+            # ------------------------------------------------
+
+            cur.execute(
+                """
+                INSERT INTO public.simples (
+
                     cnpj_basico,
+
                     opcao_simples,
+
                     data_opcao_simples,
+
                     data_exclusao_simples,
+
                     opcao_mei,
+
                     data_opcao_mei,
+
                     data_exclusao_mei,
+
                     competencia,
+
                     carga_id
                 )
+
                 SELECT
+
                     cnpj_basico,
+
                     opcao_simples,
+
                     data_opcao_simples,
+
                     data_exclusao_simples,
+
                     opcao_mei,
+
                     data_opcao_mei,
+
                     data_exclusao_mei,
+
                     %s,
+
                     %s
+
                 FROM tmp_simples
+
                 ON CONFLICT (
                     cnpj_basico,
                     competencia
                 )
+
                 DO NOTHING
+
                 RETURNING cnpj_basico
-            """, (
-                COMPETENCIA,
-                CARGA_ID
-            ))
+                """,
+                (
+                    COMPETENCIA,
+                    carga_id,
+                ),
+            )
 
             inseridos = cur.rowcount
 
         conn.commit()
 
-        duplicados = quantidade_lote - inseridos
+        duplicados = (
+            quantidade_lote
+            - inseridos
+        )
 
-        return inseridos, duplicados, 0
+        return (
+            inseridos,
+            duplicados,
+            0,
+        )
 
     except Exception as erro:
 
@@ -154,96 +265,58 @@ def inserir_lote(conn, lote):
         print("=" * 70)
         print("ERRO AO INSERIR LOTE DO SIMPLES")
         print("=" * 70)
-        print(f"Tamanho do lote: {quantidade_lote:,}")
-        print(f"Erro: {erro}")
+
+        print(
+            f"Tamanho do lote: "
+            f"{quantidade_lote:,}"
+        )
+
+        print(
+            f"Erro: {erro}"
+        )
+
         print("=" * 70)
 
-        return 0, 0, quantidade_lote
+        return (
+            0,
+            0,
+            quantidade_lote,
+        )
 
 
-def atualizar_carga(
-    conn,
-    registros_lidos,
-    registros_processados,
-    registros_inseridos,
-    registros_duplicados,
-    registros_erro=0,
-    status=None,
-    mensagem_erro=None
-):
-
-    with conn.cursor() as cur:
-
-        if status:
-
-            cur.execute("""
-                UPDATE cargas
-                SET
-                    data_fim = CURRENT_TIMESTAMP,
-                    status = %s,
-                    registros_lidos = %s,
-                    registros_processados = %s,
-                    registros_inseridos = %s,
-                    registros_duplicados = %s,
-                    registros_erro = %s,
-                    mensagem_erro = %s
-                WHERE id = %s
-            """, (
-                status,
-                registros_lidos,
-                registros_processados,
-                registros_inseridos,
-                registros_duplicados,
-                registros_erro,
-                mensagem_erro,
-                CARGA_ID
-            ))
-
-        else:
-
-            cur.execute("""
-                UPDATE cargas
-                SET
-                    registros_lidos = %s,
-                    registros_processados = %s,
-                    registros_inseridos = %s,
-                    registros_duplicados = %s,
-                    registros_erro = %s
-                WHERE id = %s
-            """, (
-                registros_lidos,
-                registros_processados,
-                registros_inseridos,
-                registros_duplicados,
-                registros_erro,
-                CARGA_ID
-            ))
-
-    conn.commit()
-
+# ============================================================
+# PROCESSAR ARQUIVO
+# ============================================================
 
 def processar_arquivo(
     arquivo,
     conn,
-    cnpjs_ce
+    cnpjs_ce,
+    carga_id,
+    totais,
 ):
+    """
+    Processa o arquivo Simples.zip.
+    """
 
     print()
     print("=" * 70)
-    print(f"PROCESSANDO: {arquivo.name}")
+
+    print(
+        f"PROCESSANDO: "
+        f"{arquivo.name}"
+    )
+
     print("=" * 70)
 
     inicio = time.time()
 
-    registros_lidos = 0
-    registros_processados = 0
-    registros_inseridos = 0
-    registros_duplicados = 0
-    registros_erro = 0
-
     lote = []
 
-    with zipfile.ZipFile(arquivo, "r") as z:
+    with zipfile.ZipFile(
+        arquivo,
+        "r",
+    ) as z:
 
         arquivos_csv = [
             nome
@@ -252,205 +325,411 @@ def processar_arquivo(
         ]
 
         if not arquivos_csv:
+
             raise RuntimeError(
-                f"Nenhum arquivo SIMPLES encontrado em {arquivo}"
+                "Nenhum arquivo SIMPLES "
+                f"encontrado em {arquivo}"
             )
 
         nome_csv = arquivos_csv[0]
 
-        print(f"Arquivo interno: {nome_csv}")
+        print(
+            f"Arquivo interno: "
+            f"{nome_csv}"
+        )
 
         with z.open(nome_csv) as arquivo_csv:
 
             texto = (
-                linha.decode("latin1")
+                linha.decode(
+                    "latin1"
+                )
                 for linha in arquivo_csv
             )
 
             leitor = csv.reader(
                 texto,
                 delimiter=";",
-                quotechar='"'
+                quotechar='"',
             )
 
             for linha in leitor:
 
-                registros_lidos += 1
+                totais["lidos"] += 1
 
                 try:
 
+                    # ----------------------------------------
+                    # LAYOUT
+                    # ----------------------------------------
+
                     if len(linha) != 7:
-                        registros_erro += 1
+
+                        totais["erros"] += 1
+
                         continue
 
-                    cnpj_basico = linha[0].strip()
+                    # ----------------------------------------
+                    # CNPJ
+                    # ----------------------------------------
 
-                    if not cnpj_basico:
-                        registros_erro += 1
+                    cnpj_basico = (
+                        linha[0].strip()
+                    )
+
+                    if (
+                        not cnpj_basico
+                        or len(cnpj_basico) != 8
+                    ):
+
+                        totais["erros"] += 1
+
                         continue
 
-                    if cnpj_basico not in cnpjs_ce:
+                    # ----------------------------------------
+                    # FILTRO CE
+                    # ----------------------------------------
+
+                    if (
+                        cnpj_basico
+                        not in cnpjs_ce
+                    ):
+
                         continue
 
-                    opcao_simples = normalizar_texto(
-                        linha[1]
+                    # ----------------------------------------
+                    # SIMPLES
+                    # ----------------------------------------
+
+                    opcao_simples = (
+                        normalizar_texto(
+                            linha[1]
+                        )
                     )
 
-                    data_opcao_simples = converter_data(
-                        linha[2]
+                    data_opcao_simples = (
+                        converter_data(
+                            linha[2]
+                        )
                     )
 
-                    data_exclusao_simples = converter_data(
-                        linha[3]
+                    data_exclusao_simples = (
+                        converter_data(
+                            linha[3]
+                        )
                     )
 
-                    opcao_mei = normalizar_texto(
-                        linha[4]
+                    # ----------------------------------------
+                    # MEI
+                    # ----------------------------------------
+
+                    opcao_mei = (
+                        normalizar_texto(
+                            linha[4]
+                        )
                     )
 
-                    data_opcao_mei = converter_data(
-                        linha[5]
+                    data_opcao_mei = (
+                        converter_data(
+                            linha[5]
+                        )
                     )
 
-                    data_exclusao_mei = converter_data(
-                        linha[6]
+                    data_exclusao_mei = (
+                        converter_data(
+                            linha[6]
+                        )
                     )
 
-                    lote.append((
-                        cnpj_basico,
-                        opcao_simples,
-                        data_opcao_simples,
-                        data_exclusao_simples,
-                        opcao_mei,
-                        data_opcao_mei,
-                        data_exclusao_mei
-                    ))
+                    # ----------------------------------------
+                    # LOTE
+                    # ----------------------------------------
 
-                    registros_processados += 1
+                    lote.append(
+                        (
+                            cnpj_basico,
+                            opcao_simples,
+                            data_opcao_simples,
+                            data_exclusao_simples,
+                            opcao_mei,
+                            data_opcao_mei,
+                            data_exclusao_mei,
+                        )
+                    )
 
-                    if len(lote) >= TAMANHO_LOTE:
+                    totais[
+                        "processados"
+                    ] += 1
+
+                    # ----------------------------------------
+                    # PROCESSAR LOTE
+                    # ----------------------------------------
+
+                    if (
+                        len(lote)
+                        >= TAMANHO_LOTE
+                    ):
 
                         (
                             inseridos,
                             duplicados,
-                            erros
+                            erros,
                         ) = inserir_lote(
                             conn,
-                            lote
+                            lote,
+                            carga_id,
                         )
 
-                        registros_inseridos += inseridos
-                        registros_duplicados += duplicados
-                        registros_erro += erros
+                        totais[
+                            "inseridos"
+                        ] += inseridos
+
+                        totais[
+                            "duplicados"
+                        ] += duplicados
+
+                        totais[
+                            "erros"
+                        ] += erros
 
                         lote.clear()
 
                         atualizar_carga(
                             conn,
-                            registros_lidos,
-                            registros_processados,
-                            registros_inseridos,
-                            registros_duplicados,
-                            registros_erro
+                            carga_id,
+                            registros_lidos=(
+                                totais["lidos"]
+                            ),
+                            registros_processados=(
+                                totais[
+                                    "processados"
+                                ]
+                            ),
+                            registros_inseridos=(
+                                totais[
+                                    "inseridos"
+                                ]
+                            ),
+                            registros_duplicados=(
+                                totais[
+                                    "duplicados"
+                                ]
+                            ),
+                            registros_erro=(
+                                totais["erros"]
+                            ),
                         )
 
                         print(
-                            f"Linhas: {registros_lidos:,} | "
-                            f"Simples CE: {registros_processados:,} | "
-                            f"Inseridos: {registros_inseridos:,} | "
-                            f"Duplicados: {registros_duplicados:,} | "
-                            f"Erros: {registros_erro:,}"
+                            f"Linhas: "
+                            f"{totais['lidos']:,} | "
+                            f"Simples CE: "
+                            f"{totais['processados']:,} | "
+                            f"Inseridos: "
+                            f"{totais['inseridos']:,} | "
+                            f"Duplicados: "
+                            f"{totais['duplicados']:,} | "
+                            f"Erros: "
+                            f"{totais['erros']:,}"
                         )
 
                 except Exception as erro:
 
-                    registros_erro += 1
+                    totais["erros"] += 1
 
                     print(
                         f"Erro na linha "
-                        f"{registros_lidos}: {erro}"
+                        f"{totais['lidos']}: "
+                        f"{erro}"
                     )
+
+            # --------------------------------------------
+            # ÚLTIMO LOTE
+            # --------------------------------------------
 
             if lote:
 
                 (
                     inseridos,
                     duplicados,
-                    erros
+                    erros,
                 ) = inserir_lote(
                     conn,
-                    lote
+                    lote,
+                    carga_id,
                 )
 
-                registros_inseridos += inseridos
-                registros_duplicados += duplicados
-                registros_erro += erros
+                totais[
+                    "inseridos"
+                ] += inseridos
+
+                totais[
+                    "duplicados"
+                ] += duplicados
+
+                totais[
+                    "erros"
+                ] += erros
 
                 lote.clear()
 
-    tempo = time.time() - inicio
+                atualizar_carga(
+                    conn,
+                    carga_id,
+                    registros_lidos=(
+                        totais["lidos"]
+                    ),
+                    registros_processados=(
+                        totais[
+                            "processados"
+                        ]
+                    ),
+                    registros_inseridos=(
+                        totais[
+                            "inseridos"
+                        ]
+                    ),
+                    registros_duplicados=(
+                        totais[
+                            "duplicados"
+                        ]
+                    ),
+                    registros_erro=(
+                        totais["erros"]
+                    ),
+                )
+
+    tempo = (
+        time.time()
+        - inicio
+    )
 
     print()
-    print(f"Linhas lidas:   {registros_lidos:,}")
-    print(f"Simples CE:     {registros_processados:,}")
-    print(f"Inseridos:      {registros_inseridos:,}")
-    print(f"Duplicados:     {registros_duplicados:,}")
-    print(f"Erros:          {registros_erro:,}")
-    print(f"Tempo:          {tempo / 60:.2f} minutos")
 
-    return (
-        registros_lidos,
-        registros_processados,
-        registros_inseridos,
-        registros_duplicados,
-        registros_erro
+    print(
+        f"Tempo do arquivo: "
+        f"{tempo / 60:.2f} minutos"
     )
 
 
+# ============================================================
+# MAIN
+# ============================================================
+
 def main():
-
-    print()
-    print("=" * 70)
-    print("CARGA DO SIMPLES NACIONAL / MEI - CEARÁ")
-    print("=" * 70)
-
-    print(f"Competência: {COMPETENCIA}")
-    print(f"Carga ID:    {CARGA_ID}")
-    print()
 
     conn = get_connection()
 
+    carga_id = None
+
+    totais = {
+        "lidos": 0,
+        "processados": 0,
+        "inseridos": 0,
+        "duplicados": 0,
+        "erros": 0,
+    }
+
     try:
 
-        cnpjs_ce = carregar_cnpjs_ce(conn)
+        # ----------------------------------------------------
+        # CARGA
+        # ----------------------------------------------------
 
-        arquivo = RAW_DIR / "Simples.zip"
-
-        if not arquivo.exists():
-            raise FileNotFoundError(
-                f"Arquivo não encontrado: {arquivo}"
-            )
-
-        (
-            total_lidos,
-            total_processados,
-            total_inseridos,
-            total_duplicados,
-            total_erros
-        ) = processar_arquivo(
-            arquivo,
+        carga_id = iniciar_carga(
             conn,
-            cnpjs_ce
+            TIPO_CARGA,
+            COMPETENCIA,
         )
 
-        atualizar_carga(
+        print()
+        print("=" * 70)
+        print(
+            "CARGA DO SIMPLES NACIONAL / MEI - CEARÁ"
+        )
+        print("=" * 70)
+
+        print(
+            f"Competência: "
+            f"{COMPETENCIA}"
+        )
+
+        print(
+            f"Carga ID:    "
+            f"{carga_id}"
+        )
+
+        print()
+
+        # ----------------------------------------------------
+        # CNPJ CE
+        # ----------------------------------------------------
+
+        cnpjs_ce = carregar_cnpjs_ce(
             conn,
-            total_lidos,
-            total_processados,
-            total_inseridos,
-            total_duplicados,
-            total_erros,
-            status="CONCLUIDA"
+            COMPETENCIA,
+        )
+
+        if not cnpjs_ce:
+
+            raise RuntimeError(
+                "Nenhum CNPJ do Ceará encontrado "
+                f"para a competência "
+                f"{COMPETENCIA}. "
+                "Execute primeiro "
+                "extrair_cnpj_ce.py."
+            )
+
+        # ----------------------------------------------------
+        # ARQUIVO
+        # ----------------------------------------------------
+
+        arquivo = (
+            RAW_DIR
+            / "Simples.zip"
+        )
+
+        if not arquivo.exists():
+
+            raise FileNotFoundError(
+                f"Arquivo não encontrado: "
+                f"{arquivo}"
+            )
+
+        # ----------------------------------------------------
+        # PROCESSAMENTO
+        # ----------------------------------------------------
+
+        processar_arquivo(
+            arquivo=arquivo,
+            conn=conn,
+            cnpjs_ce=cnpjs_ce,
+            carga_id=carga_id,
+            totais=totais,
+        )
+
+        # ----------------------------------------------------
+        # CONCLUIR
+        # ----------------------------------------------------
+
+        concluir_carga(
+            conn,
+            carga_id,
+            registros_lidos=(
+                totais["lidos"]
+            ),
+            registros_processados=(
+                totais["processados"]
+            ),
+            registros_inseridos=(
+                totais["inseridos"]
+            ),
+            registros_duplicados=(
+                totais["duplicados"]
+            ),
+            registros_erro=(
+                totais["erros"]
+            ),
         )
 
         print()
@@ -458,46 +737,98 @@ def main():
         print("CARGA DO SIMPLES CONCLUÍDA")
         print("=" * 70)
 
-        print(f"Linhas lidas:   {total_lidos:,}")
-        print(f"Simples CE:     {total_processados:,}")
-        print(f"Inseridos:      {total_inseridos:,}")
-        print(f"Duplicados:     {total_duplicados:,}")
-        print(f"Erros:          {total_erros:,}")
+        print(
+            f"Linhas lidas: "
+            f"{totais['lidos']:,}"
+        )
+
+        print(
+            f"Simples CE:   "
+            f"{totais['processados']:,}"
+        )
+
+        print(
+            f"Inseridos:    "
+            f"{totais['inseridos']:,}"
+        )
+
+        print(
+            f"Duplicados:   "
+            f"{totais['duplicados']:,}"
+        )
+
+        print(
+            f"Erros:        "
+            f"{totais['erros']:,}"
+        )
 
         print("=" * 70)
 
     except KeyboardInterrupt:
 
-        conn.rollback()
+        if carga_id is not None:
+
+            interromper_carga(
+                conn,
+                carga_id,
+                registros_lidos=(
+                    totais["lidos"]
+                ),
+                registros_processados=(
+                    totais["processados"]
+                ),
+                registros_inseridos=(
+                    totais["inseridos"]
+                ),
+                registros_duplicados=(
+                    totais["duplicados"]
+                ),
+                registros_erro=(
+                    totais["erros"]
+                ),
+            )
 
         print()
-        print("Processamento interrompido.")
+        print("=" * 70)
+        print(
+            "PROCESSAMENTO INTERROMPIDO "
+            "PELO USUÁRIO"
+        )
+        print("=" * 70)
+
+        raise
 
     except Exception as erro:
 
-        conn.rollback()
+        if carga_id is not None:
+
+            falhar_carga(
+                conn,
+                carga_id,
+                erro,
+                registros_lidos=(
+                    totais["lidos"]
+                ),
+                registros_processados=(
+                    totais["processados"]
+                ),
+                registros_inseridos=(
+                    totais["inseridos"]
+                ),
+                registros_duplicados=(
+                    totais["duplicados"]
+                ),
+                registros_erro=(
+                    totais["erros"]
+                ),
+            )
 
         print()
         print("=" * 70)
         print("ERRO NA CARGA DO SIMPLES")
         print("=" * 70)
         print(erro)
-
-        try:
-
-            atualizar_carga(
-                conn,
-                0,
-                0,
-                0,
-                0,
-                1,
-                status="ERRO",
-                mensagem_erro=str(erro)
-            )
-
-        except Exception:
-            pass
+        print("=" * 70)
 
         raise
 

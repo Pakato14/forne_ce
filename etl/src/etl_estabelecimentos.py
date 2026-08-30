@@ -1,20 +1,26 @@
 import csv
-import zipfile
 import time
+import zipfile
 from datetime import datetime
 
-from config import RAW_DIR
+from config import RAW_DIR, COMPETENCIA
 from database import get_connection
+from services.carga_service import (
+    iniciar_carga,
+    atualizar_carga,
+    concluir_carga,
+    falhar_carga,
+    interromper_carga,
+)
 
 
-COMPETENCIA = "2026-08"
-CARGA_ID = 2
+TIPO_CARGA = "ESTABELECIMENTOS"
 TAMANHO_LOTE = 10_000
 
 
-# ================================================================
-# CARREGAR CÓDIGOS VÁLIDOS
-# ================================================================
+# ============================================================
+# DOMÍNIOS
+# ============================================================
 
 def carregar_codigos_validos(conn, tabela):
     """
@@ -23,10 +29,12 @@ def carregar_codigos_validos(conn, tabela):
 
     with conn.cursor() as cur:
 
-        cur.execute(f"""
+        cur.execute(
+            f"""
             SELECT codigo
-            FROM {tabela}
-        """)
+            FROM public.{tabela}
+            """
+        )
 
         return {
             str(row[0]).strip()
@@ -35,20 +43,31 @@ def carregar_codigos_validos(conn, tabela):
         }
 
 
-# ================================================================
-# CNPJs DO CEARÁ
-# ================================================================
+# ============================================================
+# CNPJS DO CEARÁ
+# ============================================================
 
-def carregar_cnpjs_ce(conn):
+def carregar_cnpjs_ce(conn, competencia):
+    """
+    Carrega somente os CNPJs do Ceará pertencentes à
+    competência que está sendo processada.
+    """
 
-    print("Carregando lista de CNPJs do Ceará...")
+    print(
+        f"Carregando CNPJs do Ceará da competência "
+        f"{competencia}..."
+    )
 
     with conn.cursor() as cur:
 
-        cur.execute("""
+        cur.execute(
+            """
             SELECT cnpj_basico
-            FROM cnpj_ce
-        """)
+            FROM public.cnpj_ce
+            WHERE competencia = %s
+            """,
+            (competencia,),
+        )
 
         cnpjs = {
             str(row[0]).strip()
@@ -63,25 +82,38 @@ def carregar_cnpjs_ce(conn):
     return cnpjs
 
 
-# ================================================================
+# ============================================================
 # EMPRESAS
-# ================================================================
+# ============================================================
 
-def carregar_empresas(conn):
+def carregar_empresas(conn, competencia):
+    """
+    Retorna:
 
-    print("Carregando empresas da competência...")
+        {
+            cnpj_basico: empresa_id
+        }
+
+    somente para a competência atual.
+    """
+
+    print(
+        f"Carregando empresas da competência "
+        f"{competencia}..."
+    )
 
     with conn.cursor() as cur:
 
-        cur.execute("""
+        cur.execute(
+            """
             SELECT
                 id,
                 cnpj_basico
-            FROM empresas
+            FROM public.empresas
             WHERE competencia = %s
-        """, (
-            COMPETENCIA,
-        ))
+            """,
+            (competencia,),
+        )
 
         empresas = {
             str(row[1]).strip(): row[0]
@@ -96,9 +128,9 @@ def carregar_empresas(conn):
     return empresas
 
 
-# ================================================================
-# DATA
-# ================================================================
+# ============================================================
+# CONVERSÕES / NORMALIZAÇÕES
+# ============================================================
 
 def converter_data(valor):
 
@@ -114,12 +146,13 @@ def converter_data(valor):
 
         return datetime.strptime(
             valor,
-            "%Y%m%d"
+            "%Y%m%d",
         ).date()
 
     except ValueError:
 
         return None
+
 
 def normalizar_ddd(valor):
 
@@ -131,25 +164,20 @@ def normalizar_ddd(valor):
     if not valor:
         return None
 
-    # Valores usados pela Receita como preenchimento
-    if valor in ("0000", "000", "00"):
+    if valor in (
+        "0000",
+        "000",
+        "00",
+    ):
         return None
 
-    # DDD brasileiro normalmente possui 2 dígitos
-    if len(valor) == 2 and valor.isdigit():
+    if (
+        len(valor) == 2
+        and valor.isdigit()
+    ):
         return valor
 
-    # Qualquer outro valor é considerado inválido
     return None
-
-def normalizar_texto(valor):
-
-    if not valor:
-        return None
-
-    valor = valor.strip()
-
-    return valor if valor else None
 
 
 def normalizar_telefone(valor):
@@ -162,18 +190,40 @@ def normalizar_telefone(valor):
     if not valor:
         return None
 
-    # Preenchimento utilizado pela Receita
     if valor == "00000000":
         return None
 
     return valor
 
 
-# ================================================================
-# INSERIR LOTE
-# ================================================================
+def normalizar_texto(valor):
 
-def inserir_lote(conn, lote):
+    if not valor:
+        return None
+
+    valor = valor.strip()
+
+    return valor or None
+
+
+# ============================================================
+# INSERÇÃO DO LOTE
+# ============================================================
+
+def inserir_lote(
+    conn,
+    lote,
+    carga_id,
+):
+    """
+    Insere lote de estabelecimentos.
+
+    Retorna:
+
+        inseridos
+        duplicados
+        erros
+    """
 
     if not lote:
         return 0, 0, 0
@@ -184,186 +234,334 @@ def inserir_lote(conn, lote):
 
         with conn.cursor() as cur:
 
-            # ----------------------------------------------------
+            # ------------------------------------------------
             # TABELA TEMPORÁRIA
-            # ----------------------------------------------------
+            # ------------------------------------------------
 
-            cur.execute("""
-                CREATE TEMP TABLE IF NOT EXISTS tmp_estabelecimentos (
+            cur.execute(
+                """
+                CREATE TEMP TABLE IF NOT EXISTS
+                tmp_estabelecimentos (
+
                     empresa_id BIGINT,
+
                     cnpj_basico VARCHAR(8),
+
                     cnpj_ordem VARCHAR(4),
+
                     cnpj_dv VARCHAR(2),
+
                     cnpj_completo VARCHAR(14),
+
                     identificador_matriz_filial VARCHAR(1),
+
                     nome_fantasia TEXT,
+
                     situacao_cadastral_codigo VARCHAR(2),
+
                     data_situacao_cadastral DATE,
+
                     motivo_situacao_codigo VARCHAR(2),
+
                     nome_cidade_exterior TEXT,
+
                     pais_codigo VARCHAR(3),
+
                     data_inicio_atividade DATE,
+
                     cnae_principal_codigo VARCHAR(7),
+
                     cnae_secundario_codigo TEXT,
+
                     tipo_logradouro TEXT,
+
                     logradouro TEXT,
+
                     numero TEXT,
+
                     complemento TEXT,
+
                     bairro TEXT,
+
                     cep VARCHAR(8),
+
                     uf VARCHAR(2),
+
                     municipio_codigo VARCHAR(4),
-                    ddd_1 VARCHAR(4),
+
+                    ddd_1 VARCHAR(3),
+
                     telefone_1 VARCHAR(20),
-                    ddd_2 VARCHAR(4),
+
+                    ddd_2 VARCHAR(3),
+
                     telefone_2 VARCHAR(20),
+
                     fax VARCHAR(20),
+
                     email TEXT,
+
                     situacao_especial TEXT,
+
                     data_situacao_especial DATE
-                ) ON COMMIT DELETE ROWS
-            """)
+                )
+                ON COMMIT DELETE ROWS
+                """
+            )
 
-            # ----------------------------------------------------
+            # ------------------------------------------------
             # COPY
-            # ----------------------------------------------------
+            # ------------------------------------------------
 
-            with cur.copy("""
+            with cur.copy(
+                """
                 COPY tmp_estabelecimentos (
+
                     empresa_id,
+
                     cnpj_basico,
+
                     cnpj_ordem,
+
                     cnpj_dv,
+
                     cnpj_completo,
+
                     identificador_matriz_filial,
+
                     nome_fantasia,
+
                     situacao_cadastral_codigo,
+
                     data_situacao_cadastral,
+
                     motivo_situacao_codigo,
+
                     nome_cidade_exterior,
+
                     pais_codigo,
+
                     data_inicio_atividade,
+
                     cnae_principal_codigo,
+
                     cnae_secundario_codigo,
+
                     tipo_logradouro,
+
                     logradouro,
+
                     numero,
+
                     complemento,
+
                     bairro,
+
                     cep,
+
                     uf,
+
                     municipio_codigo,
+
                     ddd_1,
+
                     telefone_1,
+
                     ddd_2,
+
                     telefone_2,
+
                     fax,
+
                     email,
+
                     situacao_especial,
+
                     data_situacao_especial
                 )
+
                 FROM STDIN
-            """) as copy:
+                """
+            ) as copy:
 
                 for registro in lote:
 
                     copy.write_row(registro)
 
-            # ----------------------------------------------------
-            # INSERÇÃO DEFINITIVA
-            # ----------------------------------------------------
+            # ------------------------------------------------
+            # INSERT DEFINITIVO
+            # ------------------------------------------------
 
-            cur.execute("""
-                INSERT INTO estabelecimentos (
+            cur.execute(
+                """
+                INSERT INTO public.estabelecimentos (
+
                     empresa_id,
+
                     cnpj_basico,
+
                     cnpj_ordem,
+
                     cnpj_dv,
+
                     cnpj_completo,
+
                     identificador_matriz_filial,
+
                     nome_fantasia,
+
                     situacao_cadastral_codigo,
+
                     data_situacao_cadastral,
+
                     motivo_situacao_codigo,
+
                     nome_cidade_exterior,
+
                     pais_codigo,
+
                     data_inicio_atividade,
+
                     cnae_principal_codigo,
+
                     cnae_secundario_codigo,
+
                     tipo_logradouro,
+
                     logradouro,
+
                     numero,
+
                     complemento,
+
                     bairro,
+
                     cep,
+
                     uf,
+
                     municipio_codigo,
+
                     ddd_1,
+
                     telefone_1,
+
                     ddd_2,
+
                     telefone_2,
+
                     fax,
+
                     email,
+
                     situacao_especial,
+
                     data_situacao_especial,
+
                     competencia,
+
                     carga_id
                 )
+
                 SELECT
+
                     empresa_id,
+
                     cnpj_basico,
+
                     cnpj_ordem,
+
                     cnpj_dv,
+
                     cnpj_completo,
+
                     identificador_matriz_filial,
+
                     nome_fantasia,
+
                     situacao_cadastral_codigo,
+
                     data_situacao_cadastral,
+
                     motivo_situacao_codigo,
+
                     nome_cidade_exterior,
+
                     pais_codigo,
+
                     data_inicio_atividade,
+
                     cnae_principal_codigo,
+
                     cnae_secundario_codigo,
+
                     tipo_logradouro,
+
                     logradouro,
+
                     numero,
+
                     complemento,
+
                     bairro,
+
                     cep,
+
                     uf,
+
                     municipio_codigo,
+
                     ddd_1,
+
                     telefone_1,
+
                     ddd_2,
+
                     telefone_2,
+
                     fax,
+
                     email,
+
                     situacao_especial,
+
                     data_situacao_especial,
+
                     %s,
+
                     %s
+
                 FROM tmp_estabelecimentos
 
                 ON CONFLICT (
                     cnpj_completo,
                     competencia
                 )
+
                 DO NOTHING
 
                 RETURNING id
-            """, (
-                COMPETENCIA,
-                CARGA_ID
-            ))
+                """,
+                (
+                    COMPETENCIA,
+                    carga_id,
+                ),
+            )
 
             inseridos = cur.rowcount
 
         conn.commit()
 
-        duplicados = quantidade_lote - inseridos
+        duplicados = (
+            quantidade_lote
+            - inseridos
+        )
 
-        return inseridos, duplicados, 0
+        return (
+            inseridos,
+            duplicados,
+            0,
+        )
 
     except Exception as erro:
 
@@ -371,94 +569,33 @@ def inserir_lote(conn, lote):
 
         print()
         print("=" * 70)
-        print("ERRO AO INSERIR LOTE DE ESTABELECIMENTOS")
+        print(
+            "ERRO AO INSERIR LOTE "
+            "DE ESTABELECIMENTOS"
+        )
         print("=" * 70)
+
         print(
             f"Tamanho do lote: "
             f"{quantidade_lote:,}"
         )
-        print(f"Erro: {erro}")
+
+        print(
+            f"Erro: {erro}"
+        )
+
         print("=" * 70)
 
-        return 0, 0, quantidade_lote
+        return (
+            0,
+            0,
+            quantidade_lote,
+        )
 
 
-# ================================================================
-# ATUALIZAR CARGA
-# ================================================================
-
-def atualizar_carga(
-    conn,
-    registros_lidos,
-    registros_processados,
-    registros_inseridos,
-    registros_duplicados,
-    registros_erro=0,
-    status=None,
-    mensagem_erro=None
-):
-
-    try:
-
-        with conn.cursor() as cur:
-
-            if status:
-
-                cur.execute("""
-                    UPDATE cargas
-                    SET
-                        data_fim = CURRENT_TIMESTAMP,
-                        status = %s,
-                        registros_lidos = %s,
-                        registros_processados = %s,
-                        registros_inseridos = %s,
-                        registros_duplicados = %s,
-                        registros_erro = %s,
-                        mensagem_erro = %s
-                    WHERE id = %s
-                """, (
-                    status,
-                    registros_lidos,
-                    registros_processados,
-                    registros_inseridos,
-                    registros_duplicados,
-                    registros_erro,
-                    mensagem_erro,
-                    CARGA_ID
-                ))
-
-            else:
-
-                cur.execute("""
-                    UPDATE cargas
-                    SET
-                        registros_lidos = %s,
-                        registros_processados = %s,
-                        registros_inseridos = %s,
-                        registros_duplicados = %s,
-                        registros_erro = %s
-                    WHERE id = %s
-                """, (
-                    registros_lidos,
-                    registros_processados,
-                    registros_inseridos,
-                    registros_duplicados,
-                    registros_erro,
-                    CARGA_ID
-                ))
-
-        conn.commit()
-
-    except Exception:
-
-        conn.rollback()
-
-        raise
-
-
-# ================================================================
+# ============================================================
 # PROCESSAR ARQUIVO
-# ================================================================
+# ============================================================
 
 def processar_arquivo(
     arquivo,
@@ -468,99 +605,131 @@ def processar_arquivo(
     motivos_validos,
     paises_validos,
     municipios_validos,
-    cnaes_validos
+    cnaes_validos,
+    carga_id,
+    totais,
 ):
+    """
+    Processa um arquivo Estabelecimentos*.zip.
+
+    Importante:
+
+    O filtro NÃO é:
+
+        uf == 'CE'
+
+    O filtro é:
+
+        cnpj_basico in cnpjs_ce
+
+    Portanto são carregados todos os estabelecimentos pertencentes
+    às empresas do recorte Ceará, inclusive eventuais filiais
+    localizadas em outros estados.
+    """
 
     print()
     print("=" * 70)
-    print(f"PROCESSANDO: {arquivo.name}")
+    print(
+        f"PROCESSANDO: "
+        f"{arquivo.name}"
+    )
     print("=" * 70)
 
     inicio = time.time()
 
-    registros_lidos = 0
-    registros_processados = 0
-    registros_inseridos = 0
-    registros_duplicados = 0
-    registros_erro = 0
-
     lote = []
 
-    with zipfile.ZipFile(arquivo, "r") as z:
-
-        arquivos = z.namelist()
+    with zipfile.ZipFile(
+        arquivo,
+        "r",
+    ) as z:
 
         csv_files = [
             nome
-            for nome in arquivos
-            if nome.upper().endswith(".ESTABELE")
+            for nome in z.namelist()
+            if nome.upper().endswith(
+                ".ESTABELE"
+            )
         ]
 
         if not csv_files:
 
             raise RuntimeError(
-                f"Nenhum arquivo ESTABELE encontrado "
-                f"em {arquivo}"
+                "Nenhum arquivo ESTABELE "
+                f"encontrado em {arquivo}"
             )
 
         nome_csv = csv_files[0]
 
         print(
-            f"Arquivo interno: {nome_csv}"
+            f"Arquivo interno: "
+            f"{nome_csv}"
         )
 
         with z.open(nome_csv) as arquivo_csv:
 
             texto = (
-                linha.decode("latin1")
+                linha.decode(
+                    "latin1"
+                )
                 for linha in arquivo_csv
             )
 
             leitor = csv.reader(
                 texto,
                 delimiter=";",
-                quotechar='"'
+                quotechar='"',
             )
 
             for linha in leitor:
 
-                registros_lidos += 1
+                totais["lidos"] += 1
 
                 try:
 
-                    # ------------------------------------------------
-                    # Quantidade de campos
-                    # ------------------------------------------------
+                    # ----------------------------------------
+                    # LAYOUT
+                    # ----------------------------------------
 
                     if len(linha) != 30:
 
-                        registros_erro += 1
+                        totais["erros"] += 1
 
                         continue
 
-                    # ------------------------------------------------
+                    # ----------------------------------------
                     # CNPJ BÁSICO
-                    # ------------------------------------------------
+                    # ----------------------------------------
 
-                    cnpj_basico = linha[0].strip()
+                    cnpj_basico = (
+                        linha[0].strip()
+                    )
 
-                    if not cnpj_basico:
+                    if (
+                        not cnpj_basico
+                        or len(cnpj_basico) != 8
+                    ):
 
-                        registros_erro += 1
-
-                        continue
-
-                    # ------------------------------------------------
-                    # FILTRO CEARÁ
-                    # ------------------------------------------------
-
-                    if cnpj_basico not in cnpjs_ce:
+                        totais["erros"] += 1
 
                         continue
 
-                    # ------------------------------------------------
+                    # ----------------------------------------
+                    # FILTRO DO RECORTE CE
+                    #
+                    # Não filtrar linha[19] == CE.
+                    # ----------------------------------------
+
+                    if (
+                        cnpj_basico
+                        not in cnpjs_ce
+                    ):
+
+                        continue
+
+                    # ----------------------------------------
                     # EMPRESA
-                    # ------------------------------------------------
+                    # ----------------------------------------
 
                     empresa_id = empresas.get(
                         cnpj_basico
@@ -568,349 +737,553 @@ def processar_arquivo(
 
                     if empresa_id is None:
 
-                        # O CNPJ está em cnpj_ce,
-                        # mas não existe na carga de empresas.
-
-                        registros_erro += 1
+                        totais["erros"] += 1
 
                         continue
 
-                    # ------------------------------------------------
-                    # CNPJ
-                    # ------------------------------------------------
+                    # ----------------------------------------
+                    # CNPJ COMPLETO
+                    # ----------------------------------------
 
-                    cnpj_ordem = linha[1].strip()
+                    cnpj_ordem = (
+                        linha[1].strip()
+                    )
 
-                    cnpj_dv = linha[2].strip()
+                    cnpj_dv = (
+                        linha[2].strip()
+                    )
 
-                    if not cnpj_ordem or not cnpj_dv:
+                    if (
+                        not cnpj_ordem
+                        or not cnpj_dv
+                    ):
 
-                        registros_erro += 1
+                        totais["erros"] += 1
 
                         continue
 
                     cnpj_completo = (
-                        cnpj_basico +
-                        cnpj_ordem +
-                        cnpj_dv
+                        cnpj_basico
+                        + cnpj_ordem
+                        + cnpj_dv
                     )
 
-                    # ------------------------------------------------
-                    # CAMPOS
-                    # ------------------------------------------------
+                    if len(cnpj_completo) != 14:
+
+                        totais["erros"] += 1
+
+                        continue
+
+                    # ----------------------------------------
+                    # IDENTIFICAÇÃO
+                    # ----------------------------------------
 
                     identificador = (
-                        linha[3].strip()
-                        or None
+                        normalizar_texto(
+                            linha[3]
+                        )
                     )
 
                     nome_fantasia = (
-                        linha[4].strip()
-                        or None
+                        normalizar_texto(
+                            linha[4]
+                        )
                     )
 
-                    situacao = (
-                        linha[5].strip()
-                        or None
-                    ) 
-                    
-                    if situacao and (
-                        len(situacao) != 2 or
-                        not situacao.isdigit()
-                    ):
-                        situacao = None                   
+                    # ----------------------------------------
+                    # SITUAÇÃO CADASTRAL
+                    # ----------------------------------------
 
-                    data_situacao = converter_data(
-                        linha[6]
+                    situacao = (
+                        normalizar_texto(
+                            linha[5]
+                        )
+                    )
+
+                    if (
+                        situacao
+                        and (
+                            len(situacao) != 2
+                            or not situacao.isdigit()
+                        )
+                    ):
+
+                        situacao = None
+
+                    data_situacao = (
+                        converter_data(
+                            linha[6]
+                        )
                     )
 
                     motivo = (
-                        linha[7].strip()
-                        or None
+                        normalizar_texto(
+                            linha[7]
+                        )
                     )
 
                     if (
                         motivo
-                        and motivo not in motivos_validos
+                        and motivo
+                        not in motivos_validos
                     ):
 
                         motivo = None
 
+                    # ----------------------------------------
+                    # EXTERIOR / PAÍS
+                    # ----------------------------------------
+
                     nome_cidade_exterior = (
-                        linha[8].strip()
-                        or None
+                        normalizar_texto(
+                            linha[8]
+                        )
                     )
 
                     pais = (
-                        linha[9].strip()
-                        or None
+                        normalizar_texto(
+                            linha[9]
+                        )
                     )
 
-                    if pais and pais not in paises_validos:
+                    if (
+                        pais
+                        and pais
+                        not in paises_validos
+                    ):
 
                         pais = None
 
-                    data_inicio = converter_data(
-                        linha[10]
+                    # ----------------------------------------
+                    # ATIVIDADE
+                    # ----------------------------------------
+
+                    data_inicio = (
+                        converter_data(
+                            linha[10]
+                        )
                     )
 
                     cnae_principal = (
-                        linha[11].strip()
-                        or None
+                        normalizar_texto(
+                            linha[11]
+                        )
                     )
 
                     if (
                         cnae_principal
-                        and cnae_principal not in cnaes_validos
+                        and cnae_principal
+                        not in cnaes_validos
                     ):
 
                         cnae_principal = None
 
                     cnae_secundario = (
-                        linha[12].strip()
-                        or None
+                        normalizar_texto(
+                            linha[12]
+                        )
                     )
 
+                    # ----------------------------------------
+                    # ENDEREÇO
+                    # ----------------------------------------
+
                     tipo_logradouro = (
-                        linha[13].strip()
-                        or None
+                        normalizar_texto(
+                            linha[13]
+                        )
                     )
 
                     logradouro = (
-                        linha[14].strip()
-                        or None
+                        normalizar_texto(
+                            linha[14]
+                        )
                     )
 
                     numero = (
-                        linha[15].strip()
-                        or None
+                        normalizar_texto(
+                            linha[15]
+                        )
                     )
 
                     complemento = (
-                        linha[16].strip()
-                        or None
+                        normalizar_texto(
+                            linha[16]
+                        )
                     )
 
                     bairro = (
-                        linha[17].strip()
-                        or None
+                        normalizar_texto(
+                            linha[17]
+                        )
                     )
 
                     cep = (
-                        linha[18].strip()
-                        or None
+                        normalizar_texto(
+                            linha[18]
+                        )
                     )
 
                     uf = (
-                        linha[19].strip()
-                        or None
+                        normalizar_texto(
+                            linha[19]
+                        )
                     )
 
                     municipio = (
-                        linha[20].strip()
-                        or None
+                        normalizar_texto(
+                            linha[20]
+                        )
                     )
 
                     if (
                         municipio
-                        and municipio not in municipios_validos
+                        and municipio
+                        not in municipios_validos
                     ):
 
                         municipio = None
 
-                    ddd_1 = normalizar_ddd(linha[21])
+                    # ----------------------------------------
+                    # TELEFONES
+                    # ----------------------------------------
 
-                    telefone_1 = normalizar_telefone(linha[22])
+                    ddd_1 = normalizar_ddd(
+                        linha[21]
+                    )
 
-                    ddd_2 = normalizar_ddd(linha[23])
+                    telefone_1 = (
+                        normalizar_telefone(
+                            linha[22]
+                        )
+                    )
 
-                    telefone_2 = normalizar_telefone(linha[22])
+                    ddd_2 = normalizar_ddd(
+                        linha[23]
+                    )
 
-                    fax = normalizar_telefone(linha[25])
+                    telefone_2 = (
+                        normalizar_telefone(
+                            linha[24]
+                        )
+                    )
+
+                    fax = normalizar_telefone(
+                        linha[25]
+                    )
+
+                    # ----------------------------------------
+                    # EMAIL
+                    # ----------------------------------------
 
                     email = (
-                        linha[26].strip()
-                        or None
+                        normalizar_texto(
+                            linha[26]
+                        )
                     )
+
+                    # ----------------------------------------
+                    # SITUAÇÃO ESPECIAL
+                    # ----------------------------------------
 
                     situacao_especial = (
-                        linha[27].strip()
-                        or None
+                        normalizar_texto(
+                            linha[27]
+                        )
                     )
 
-                    data_situacao_especial = converter_data(
-                        linha[28]
+                    data_situacao_especial = (
+                        converter_data(
+                            linha[28]
+                        )
                     )
 
-                    # campo_30 é ignorado
+                    # linha[29] é ignorada
 
-                    # ------------------------------------------------
+                    # ----------------------------------------
                     # LOTE
-                    # ------------------------------------------------
+                    # ----------------------------------------
 
-                    lote.append((
-                        empresa_id,
-                        cnpj_basico,
-                        cnpj_ordem,
-                        cnpj_dv,
-                        cnpj_completo,
-                        identificador,
-                        nome_fantasia,
-                        situacao,
-                        data_situacao,
-                        motivo,
-                        nome_cidade_exterior,
-                        pais,
-                        data_inicio,
-                        cnae_principal,
-                        cnae_secundario,
-                        tipo_logradouro,
-                        logradouro,
-                        numero,
-                        complemento,
-                        bairro,
-                        cep,
-                        uf,
-                        municipio,
-                        ddd_1,
-                        telefone_1,
-                        ddd_2,
-                        telefone_2,
-                        fax,
-                        email,
-                        situacao_especial,
-                        data_situacao_especial
-                    ))
+                    lote.append(
+                        (
+                            empresa_id,
+                            cnpj_basico,
+                            cnpj_ordem,
+                            cnpj_dv,
+                            cnpj_completo,
+                            identificador,
+                            nome_fantasia,
+                            situacao,
+                            data_situacao,
+                            motivo,
+                            nome_cidade_exterior,
+                            pais,
+                            data_inicio,
+                            cnae_principal,
+                            cnae_secundario,
+                            tipo_logradouro,
+                            logradouro,
+                            numero,
+                            complemento,
+                            bairro,
+                            cep,
+                            uf,
+                            municipio,
+                            ddd_1,
+                            telefone_1,
+                            ddd_2,
+                            telefone_2,
+                            fax,
+                            email,
+                            situacao_especial,
+                            data_situacao_especial,
+                        )
+                    )
 
-                    registros_processados += 1
+                    totais[
+                        "processados"
+                    ] += 1
 
-                    # ------------------------------------------------
+                    # ----------------------------------------
                     # PROCESSAR LOTE
-                    # ------------------------------------------------
+                    # ----------------------------------------
 
-                    if len(lote) >= TAMANHO_LOTE:
+                    if (
+                        len(lote)
+                        >= TAMANHO_LOTE
+                    ):
 
-                        inseridos, duplicados, erros = inserir_lote(
+                        (
+                            inseridos,
+                            duplicados,
+                            erros,
+                        ) = inserir_lote(
                             conn,
-                            lote
+                            lote,
+                            carga_id,
                         )
 
-                        registros_inseridos += inseridos
-                        registros_duplicados += duplicados
-                        registros_erro += erros
+                        totais[
+                            "inseridos"
+                        ] += inseridos
+
+                        totais[
+                            "duplicados"
+                        ] += duplicados
+
+                        totais[
+                            "erros"
+                        ] += erros
 
                         lote.clear()
 
                         atualizar_carga(
                             conn,
-                            registros_lidos,
-                            registros_processados,
-                            registros_inseridos,
-                            registros_duplicados,
-                            registros_erro
+                            carga_id,
+                            registros_lidos=(
+                                totais["lidos"]
+                            ),
+                            registros_processados=(
+                                totais[
+                                    "processados"
+                                ]
+                            ),
+                            registros_inseridos=(
+                                totais[
+                                    "inseridos"
+                                ]
+                            ),
+                            registros_duplicados=(
+                                totais[
+                                    "duplicados"
+                                ]
+                            ),
+                            registros_erro=(
+                                totais["erros"]
+                            ),
                         )
 
                         print(
-                            f"Linhas: {registros_lidos:,} | "
-                            f"Estabelecimentos CE: "
-                            f"{registros_processados:,} | "
+                            f"Linhas: "
+                            f"{totais['lidos']:,} | "
+                            f"Estabelecimentos: "
+                            f"{totais['processados']:,} | "
                             f"Inseridos: "
-                            f"{registros_inseridos:,} | "
+                            f"{totais['inseridos']:,} | "
                             f"Duplicados: "
-                            f"{registros_duplicados:,} | "
+                            f"{totais['duplicados']:,} | "
                             f"Erros: "
-                            f"{registros_erro:,}"
+                            f"{totais['erros']:,}"
                         )
 
                 except Exception as erro:
 
-                    registros_erro += 1
+                    totais["erros"] += 1
 
                     print(
                         f"Erro na linha "
-                        f"{registros_lidos}: {erro}"
+                        f"{totais['lidos']}: "
+                        f"{erro}"
                     )
 
-            # --------------------------------------------------------
+            # --------------------------------------------
             # ÚLTIMO LOTE
-            # --------------------------------------------------------
+            # --------------------------------------------
 
             if lote:
 
-                inseridos, duplicados, erros = inserir_lote(
+                (
+                    inseridos,
+                    duplicados,
+                    erros,
+                ) = inserir_lote(
                     conn,
-                    lote
+                    lote,
+                    carga_id,
                 )
 
-                registros_inseridos += inseridos
-                registros_duplicados += duplicados
-                registros_erro += erros
+                totais[
+                    "inseridos"
+                ] += inseridos
+
+                totais[
+                    "duplicados"
+                ] += duplicados
+
+                totais[
+                    "erros"
+                ] += erros
 
                 lote.clear()
 
-    tempo = time.time() - inicio
+                atualizar_carga(
+                    conn,
+                    carga_id,
+                    registros_lidos=(
+                        totais["lidos"]
+                    ),
+                    registros_processados=(
+                        totais[
+                            "processados"
+                        ]
+                    ),
+                    registros_inseridos=(
+                        totais[
+                            "inseridos"
+                        ]
+                    ),
+                    registros_duplicados=(
+                        totais[
+                            "duplicados"
+                        ]
+                    ),
+                    registros_erro=(
+                        totais["erros"]
+                    ),
+                )
+
+    tempo = (
+        time.time()
+        - inicio
+    )
 
     print()
-    print(f"Linhas lidas:       {registros_lidos:,}")
-    print(f"Estabelecimentos CE:{registros_processados:,}")
-    print(f"Estabelecimentos novos: {registros_inseridos:,}")
-    print(f"Duplicados:         {registros_duplicados:,}")
-    print(f"Erros:              {registros_erro:,}")
-    print(f"Tempo:              {tempo / 60:.2f} minutos")
 
-    return (
-        registros_lidos,
-        registros_processados,
-        registros_inseridos,
-        registros_duplicados,
-        registros_erro
+    print(
+        f"Tempo do arquivo: "
+        f"{tempo / 60:.2f} minutos"
     )
 
 
-# ================================================================
+# ============================================================
 # MAIN
-# ================================================================
+# ============================================================
 
 def main():
 
-    print()
-    print("=" * 70)
-    print("CARGA DE ESTABELECIMENTOS DO CEARÁ")
-    print("=" * 70)
-
-    print(f"Competência: {COMPETENCIA}")
-    print(f"Carga ID:    {CARGA_ID}")
-    print()
-
     conn = get_connection()
+
+    carga_id = None
+
+    totais = {
+
+        "lidos": 0,
+
+        "processados": 0,
+
+        "inseridos": 0,
+
+        "duplicados": 0,
+
+        "erros": 0,
+    }
 
     try:
 
-        # --------------------------------------------------------
-        # CÓDIGOS DE DOMÍNIO
-        # --------------------------------------------------------
+        # ----------------------------------------------------
+        # CARGA
+        # ----------------------------------------------------
 
-        print("Carregando tabelas de domínio...")
-        
-
-        motivos_validos = carregar_codigos_validos(
+        carga_id = iniciar_carga(
             conn,
-            "motivos_situacao"
+            TIPO_CARGA,
+            COMPETENCIA,
         )
 
-        paises_validos = carregar_codigos_validos(
-            conn,
-            "paises"
+        print()
+        print("=" * 70)
+        print(
+            "CARGA DE ESTABELECIMENTOS "
+            "DO RECORTE CEARÁ"
+        )
+        print("=" * 70)
+
+        print(
+            f"Competência: "
+            f"{COMPETENCIA}"
         )
 
-        municipios_validos = carregar_codigos_validos(
-            conn,
-            "municipios"
+        print(
+            f"Carga ID:    "
+            f"{carga_id}"
         )
 
-        cnaes_validos = carregar_codigos_validos(
-            conn,
-            "cnaes"
+        print()
+
+        # ----------------------------------------------------
+        # DOMÍNIOS
+        # ----------------------------------------------------
+
+        print(
+            "Carregando tabelas de domínio..."
+        )
+
+        motivos_validos = (
+            carregar_codigos_validos(
+                conn,
+                "motivos_situacao",
+            )
+        )
+
+        paises_validos = (
+            carregar_codigos_validos(
+                conn,
+                "paises",
+            )
+        )
+
+        municipios_validos = (
+            carregar_codigos_validos(
+                conn,
+                "municipios",
+            )
+        )
+
+        cnaes_validos = (
+            carregar_codigos_validos(
+                conn,
+                "cnaes",
+            )
         )
 
         print(
@@ -933,43 +1306,87 @@ def main():
             f"{len(cnaes_validos):,}"
         )
 
-        # --------------------------------------------------------
-        # CNPJs CE
-        # --------------------------------------------------------
+        # ----------------------------------------------------
+        # CNPJ CE
+        # ----------------------------------------------------
 
-        cnpjs_ce = carregar_cnpjs_ce(conn)
+        cnpjs_ce = carregar_cnpjs_ce(
+            conn,
+            COMPETENCIA,
+        )
 
         if not cnpjs_ce:
 
             raise RuntimeError(
-                "A tabela cnpj_ce está vazia."
+                "Nenhum CNPJ do Ceará encontrado "
+                f"para a competência "
+                f"{COMPETENCIA}. "
+                "Execute primeiro "
+                "extrair_cnpj_ce.py."
             )
 
-        # --------------------------------------------------------
+        # ----------------------------------------------------
         # EMPRESAS
-        # --------------------------------------------------------
+        # ----------------------------------------------------
 
-        empresas = carregar_empresas(conn)
+        empresas = carregar_empresas(
+            conn,
+            COMPETENCIA,
+        )
 
         if not empresas:
 
             raise RuntimeError(
-                f"Nenhuma empresa encontrada "
-                f"para a competência {COMPETENCIA}."
+                "Nenhuma empresa encontrada "
+                f"para a competência "
+                f"{COMPETENCIA}. "
+                "Execute primeiro "
+                "load_empresas_ce.py."
             )
 
-        # --------------------------------------------------------
+        # ----------------------------------------------------
+        # VALIDAÇÃO DE CONSISTÊNCIA
+        # ----------------------------------------------------
+
+        faltantes = (
+            len(cnpjs_ce)
+            - len(empresas)
+        )
+
+        print()
+
+        print(
+            f"CNPJs CE:             "
+            f"{len(cnpjs_ce):,}"
+        )
+
+        print(
+            f"Empresas carregadas:  "
+            f"{len(empresas):,}"
+        )
+
+        if faltantes > 0:
+
+            print(
+                f"Atenção: existem "
+                f"{faltantes:,} CNPJs CE "
+                f"sem empresa carregada."
+            )
+
+        # ----------------------------------------------------
         # ARQUIVOS
-        # --------------------------------------------------------
+        # ----------------------------------------------------
 
         arquivos = sorted(
-            RAW_DIR.glob("Estabelecimentos*.zip")
+            RAW_DIR.glob(
+                "Estabelecimentos*.zip"
+            )
         )
 
         if not arquivos:
 
             raise FileNotFoundError(
-                f"Nenhum Estabelecimentos*.zip "
+                "Nenhum Estabelecimentos*.zip "
                 f"encontrado em {RAW_DIR}"
             )
 
@@ -983,131 +1400,157 @@ def main():
             )
 
         print()
+
         print(
-            f"Total: {len(arquivos)} arquivos"
+            f"Total: "
+            f"{len(arquivos)} arquivos"
         )
 
-        # --------------------------------------------------------
-        # TOTAIS
-        # --------------------------------------------------------
-
-        total_lidos = 0
-        total_processados = 0
-        total_inseridos = 0
-        total_duplicados = 0
-        total_erros = 0
-
-        # --------------------------------------------------------
-        # PROCESSAR
-        # --------------------------------------------------------
+        # ----------------------------------------------------
+        # PROCESSAMENTO
+        # ----------------------------------------------------
 
         for arquivo in arquivos:
 
-            resultado = processar_arquivo(
-                arquivo,
-                conn,
-                cnpjs_ce,
-                empresas,
-                motivos_validos,
-                paises_validos,
-                municipios_validos,
-                cnaes_validos
+            processar_arquivo(
+                arquivo=arquivo,
+                conn=conn,
+                cnpjs_ce=cnpjs_ce,
+                empresas=empresas,
+                motivos_validos=motivos_validos,
+                paises_validos=paises_validos,
+                municipios_validos=(
+                    municipios_validos
+                ),
+                cnaes_validos=cnaes_validos,
+                carga_id=carga_id,
+                totais=totais,
             )
 
-            (
-                lidos,
-                processados,
-                inseridos,
-                duplicados,
-                erros
-            ) = resultado
+        # ----------------------------------------------------
+        # CONCLUIR
+        # ----------------------------------------------------
 
-            total_lidos += lidos
-            total_processados += processados
-            total_inseridos += inseridos
-            total_duplicados += duplicados
-            total_erros += erros
-
-        # --------------------------------------------------------
-        # FINALIZAR
-        # --------------------------------------------------------
-
-        atualizar_carga(
+        concluir_carga(
             conn,
-            total_lidos,
-            total_processados,
-            total_inseridos,
-            total_duplicados,
-            total_erros,
-            status="CONCLUIDA"
+            carga_id,
+            registros_lidos=(
+                totais["lidos"]
+            ),
+            registros_processados=(
+                totais["processados"]
+            ),
+            registros_inseridos=(
+                totais["inseridos"]
+            ),
+            registros_duplicados=(
+                totais["duplicados"]
+            ),
+            registros_erro=(
+                totais["erros"]
+            ),
         )
 
         print()
         print("=" * 70)
-        print("CARGA DE ESTABELECIMENTOS CONCLUÍDA")
+        print(
+            "CARGA DE ESTABELECIMENTOS "
+            "CONCLUÍDA"
+        )
         print("=" * 70)
 
         print(
             f"Linhas lidas:          "
-            f"{total_lidos:,}"
+            f"{totais['lidos']:,}"
         )
 
         print(
-            f"Estabelecimentos CE:   "
-            f"{total_processados:,}"
+            f"Estabelecimentos:      "
+            f"{totais['processados']:,}"
         )
 
         print(
-            f"Estabelecimentos novos:"
-            f" {total_inseridos:,}"
+            f"Inseridos:             "
+            f"{totais['inseridos']:,}"
         )
 
         print(
             f"Duplicados:            "
-            f"{total_duplicados:,}"
+            f"{totais['duplicados']:,}"
         )
 
         print(
             f"Erros:                 "
-            f"{total_erros:,}"
+            f"{totais['erros']:,}"
         )
 
         print("=" * 70)
 
     except KeyboardInterrupt:
 
+        if carga_id is not None:
+
+            interromper_carga(
+                conn,
+                carga_id,
+                registros_lidos=(
+                    totais["lidos"]
+                ),
+                registros_processados=(
+                    totais["processados"]
+                ),
+                registros_inseridos=(
+                    totais["inseridos"]
+                ),
+                registros_duplicados=(
+                    totais["duplicados"]
+                ),
+                registros_erro=(
+                    totais["erros"]
+                ),
+            )
+
         print()
         print("=" * 70)
-        print("PROCESSAMENTO INTERROMPIDO PELO USUÁRIO")
+        print(
+            "PROCESSAMENTO INTERROMPIDO "
+            "PELO USUÁRIO"
+        )
         print("=" * 70)
 
-        conn.rollback()
+        raise
 
     except Exception as erro:
 
-        conn.rollback()
+        if carga_id is not None:
+
+            falhar_carga(
+                conn,
+                carga_id,
+                erro,
+                registros_lidos=(
+                    totais["lidos"]
+                ),
+                registros_processados=(
+                    totais["processados"]
+                ),
+                registros_inseridos=(
+                    totais["inseridos"]
+                ),
+                registros_duplicados=(
+                    totais["duplicados"]
+                ),
+                registros_erro=(
+                    totais["erros"]
+                ),
+            )
 
         print()
         print("=" * 70)
         print("ERRO NA CARGA")
         print("=" * 70)
         print(erro)
-
-        try:
-
-            atualizar_carga(
-                conn,
-                0,
-                0,
-                0,
-                0,
-                1,
-                status="ERRO",
-                mensagem_erro=str(erro)
-            )
-
-        except Exception:
-            pass
+        print("=" * 70)
 
         raise
 
