@@ -25,7 +25,7 @@ __pycache__/
 # Dados da Receita Federal
 # ============================================================
 
-data/raw/*
+etl/data/raw/*
 !data/raw/.gitkeep
 
 # ============================================================
@@ -56,4 +56,3 @@ logs/
 
 .DS_Store
 Thumbs.db
-etl/data/raw/*
