@@ -1,10 +1,14 @@
-const { Router } = require('express')
-const EmpresaControllers = require('../controllers/EmpresaControllerss')
-var auth = require('../service/AutenticaService')
-var checkRole = require('../service/checkRole')
+const { Router } = require("express");
+const EmpresaControllers = require("../controllers/EmpresaControllers");
+var auth = require("../services/AutenticaService");
+var checkRole = require("../services/checkRole");
 
+const router = Router();
 
-const router = Router()
-router.post('/register', EmpresaControllers.cadastraUser)
+router.get("/estatisticas/ativas", EmpresaControllers.quantidadeEmpresasAtivas );
+router.get("/estatisticas/por-cnae", EmpresaControllers.quantidadeEmpresasPorCnae );
+router.get("/cnae/:cnae", EmpresaControllers.listarEmpresasPorCnae );
+router.get("/listarcnae/cnae", EmpresaControllers.listarCnaes );
+router.get("/listarempresas/ativas", EmpresaControllers.listarEmpresasAtivas );
 
-module.exports = router
+module.exports = router;

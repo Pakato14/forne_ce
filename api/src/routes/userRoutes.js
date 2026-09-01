@@ -1,7 +1,7 @@
 const { Router } = require('express')
 const UserController = require('../controllers/UserControllers')
-var auth = require('../service/AutenticaService')
-var checkRole = require('../service/checkRole')
+var auth = require('../services/AutenticaService')
+var checkRole = require('../services/checkRole')
 
 
 const router = Router()
