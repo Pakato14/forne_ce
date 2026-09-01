@@ -127,6 +127,153 @@ class EmpresaControllers {
   }
 
   /**
+   * GET /api/empresas/estatisticas/por-municipio
+   *
+   * Query params opcionais:
+   *   uf=CE
+   *   competencia=2026-08
+   */
+  static async quantidadeEmpresasAtivasMunicipio(req, res) {
+    try {
+      const uf = String(req.query.uf || "CE")
+        .trim()
+        .toUpperCase();
+
+      if (!/^[A-Z]{2}$/.test(uf)) {
+        return res.status(400).json({
+          message: "A UF deve conter exatamente duas letras.",
+        });
+      }
+
+      /*
+       * Usa a competência informada ou busca
+       * automaticamente a mais recente.
+       */
+      const competencia = await EmpresaControllers.obterCompetencia(
+        req.query.competencia,
+      );
+
+      if (!competencia) {
+        return res.status(404).json({
+          message: "Nenhuma competência encontrada.",
+        });
+      }
+
+      const municipios = await database.sequelize.query(
+        `
+          SELECT
+            est.municipio_codigo,
+            mun.nome AS municipio,
+
+            COUNT(
+              DISTINCT est.cnpj_basico
+            )::BIGINT AS quantidade_empresas,
+
+            COUNT(
+              DISTINCT est.cnpj_completo
+            )::BIGINT AS quantidade_estabelecimentos,
+
+            COUNT(
+              DISTINCT CASE
+                WHEN est.identificador_matriz_filial = '1'
+                THEN est.cnpj_completo
+              END
+            )::BIGINT AS quantidade_matrizes,
+
+            COUNT(
+              DISTINCT CASE
+                WHEN est.identificador_matriz_filial = '2'
+                THEN est.cnpj_completo
+              END
+            )::BIGINT AS quantidade_filiais
+
+          FROM public.estabelecimentos est
+
+          INNER JOIN public.municipios mun
+            ON mun.codigo =
+               est.municipio_codigo
+
+          WHERE est.uf = :uf
+            AND est.competencia = :competencia
+            AND est.situacao_cadastral_codigo = '02'
+
+          GROUP BY
+            est.municipio_codigo,
+            mun.nome
+
+          ORDER BY
+            quantidade_empresas DESC,
+            mun.nome ASC
+        `,
+        {
+          replacements: {
+            uf,
+            competencia,
+          },
+
+          type: QueryTypes.SELECT,
+        },
+      );
+
+      /*
+       * O PostgreSQL devolve valores BIGINT como string.
+       * Por isso convertemos os contadores para Number.
+       */
+      const dados = municipios.map((municipio) => ({
+        municipio_codigo: municipio.municipio_codigo,
+
+        municipio: municipio.municipio,
+
+        quantidade_empresas: Number(municipio.quantidade_empresas),
+
+        quantidade_estabelecimentos: Number(
+          municipio.quantidade_estabelecimentos,
+        ),
+
+        quantidade_matrizes: Number(municipio.quantidade_matrizes),
+
+        quantidade_filiais: Number(municipio.quantidade_filiais),
+      }));
+
+      const totalEmpresas = dados.reduce(
+        (total, municipio) => total + municipio.quantidade_empresas,
+        0,
+      );
+
+      const totalEstabelecimentos = dados.reduce(
+        (total, municipio) => total + municipio.quantidade_estabelecimentos,
+        0,
+      );
+
+      return res.status(200).json({
+        filtros: {
+          uf,
+          competencia,
+
+          situacao_cadastral: {
+            codigo: "02",
+            descricao: "ATIVA",
+          },
+        },
+
+        resumo: {
+          quantidade_municipios: dados.length,
+          total_empresas: totalEmpresas,
+          total_estabelecimentos: totalEstabelecimentos,
+        },
+
+        dados,
+      });
+    } catch (error) {
+      console.error("Erro ao consultar empresas por município:", error);
+
+      return res.status(error.status || 500).json({
+        message: error.message || "Erro ao consultar empresas por município.",
+      });
+    }
+  }
+
+  /**
    * GET /api/empresas/estatisticas/por-cnae
    *
    * Retorna a quantidade de estabelecimentos ativos agrupada
@@ -144,12 +291,12 @@ class EmpresaControllers {
         .trim()
         .toUpperCase();
 
-      const page = Math.max(Number.parseInt(req.query.page, 10) || 1, 1);
+      const page = 10;//Math.max(Number.parseInt(req.query.page, 10) || 1, 1);
 
-      const limit = Math.min(
+      const limit = 10;/*Math.min(
         Math.max(Number.parseInt(req.query.limit, 10) || 50, 1),
         100,
-      );
+      );*/
 
       const offset = (page - 1) * limit;
 
